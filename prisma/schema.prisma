@@ -1,0 +1,182 @@
+// Prisma Schema for DAVIS — Multi-tenant Data Model
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ── Multi-Tenancy ──
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users               User[]
+  databaseConnections DatabaseConnection[]
+  knowledgeBases      KnowledgeBase[]
+  chatSessions        ChatSession[]
+  auditLogs           AuditLog[]
+
+  @@map("organizations")
+}
+
+// ── Authentication ──
+
+model User {
+  id           String   @id @default(cuid())
+  email        String
+  passwordHash String
+  name         String
+  role         String   @default("MEMBER")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  chatSessions ChatSession[]
+  auditLogs    AuditLog[]
+
+  @@unique([email, organizationId])
+  @@map("users")
+}
+
+// ── Database Connections ──
+
+model DatabaseConnection {
+  id               String           @id @default(cuid())
+  name             String
+  type             String
+  host             String
+  port             Int
+  database         String
+  username         String
+  encryptedPassword String          // AES-256 encrypted
+  ssl              Boolean          @default(false)
+  status           String           @default("DISCONNECTED")
+  lastTestedAt     DateTime?
+  schemaCache      String?          // Cached schema introspection (stored as stringified JSON)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  chatMessages ChatMessage[]
+
+  @@map("database_connections")
+}
+
+// ── Knowledge Base & Documents ──
+
+model KnowledgeBase {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  documents Document[]
+
+  @@map("knowledge_bases")
+}
+
+model Document {
+  id          String         @id @default(cuid())
+  name        String
+  type        String
+  size        Int            // bytes
+  status      String         @default("PENDING")
+  sourceUrl   String?        // For web-scraped documents
+  errorMessage String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  knowledgeBaseId String
+  knowledgeBase   KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+
+  chunks DocumentChunk[]
+
+  @@map("documents")
+}
+
+model DocumentChunk {
+  id        String   @id @default(cuid())
+  content   String   // The text chunk
+  metadata  String?  // Page number, section, etc. (stored as stringified JSON)
+  embedding Bytes?   // Vector embedding (stored as binary for pgvector compatibility)
+  chunkIndex Int     // Order within document
+  createdAt DateTime @default(now())
+
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@map("document_chunks")
+}
+
+// ── Chat ──
+
+model ChatSession {
+  id        String   @id @default(cuid())
+  title     String   @default("New Chat")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  messages ChatMessage[]
+
+  @@map("chat_sessions")
+}
+
+model ChatMessage {
+  id        String      @id @default(cuid())
+  role      String
+  content   String
+  metadata  String?     // SQL queries, chart configs, etc. (stored as stringified JSON)
+  createdAt DateTime    @default(now())
+
+  sessionId String
+  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  // Optional: which DB connection was queried
+  connectionId String?
+  connection   DatabaseConnection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+
+  @@index([sessionId])
+  @@map("chat_messages")
+}
+
+// ── Audit Log ──
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  action    String   // e.g., "connection.created", "query.executed"
+  details   String?  // stored as stringified JSON
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, createdAt])
+  @@map("audit_logs")
+}
