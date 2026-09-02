@@ -1,15 +1,231 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { DatabaseConnection } from "@/components/connections/AddConnectionModal";
 
 import ReactMarkdown from 'react-markdown';
+// Without remark-gfm, react-markdown does not implement GitHub-flavoured
+// markdown — so tables, strikethrough and task lists pass through as literal
+// pipe characters instead of rendering. DAVIS answers tabular results with
+// markdown tables, so this plugin is required, not optional.
+import remarkGfm from 'remark-gfm';
+
+/**
+ * Five different things go wrong and they need five different messages:
+ *   overloaded -> Google has no capacity. Not the user's fault, retry works.
+ *   quota      -> this deployment's own API limit. Retrying now won't help.
+ *   config     -> a configured model ID is wrong/retired. Retrying never helps.
+ *   failed     -> the question couldn't be turned into a query we trust.
+ *   network    -> the browser couldn't reach the server at all.
+ * Showing one generic "Error:" for all of them makes the app impossible to debug.
+ */
+type NoticeKind =
+  | "overloaded"
+  | "quota"
+  | "failed"
+  | "network"
+  | "config"
+  | "timeout";
+
+/** One pipeline step, as reported by the server. Every entry is real work. */
+interface TraceEntry {
+  id: string;
+  label: string;
+  detail?: string;
+  ms: number;
+  running?: boolean;
+}
 
 interface Message {
   id: string;
   role: "USER" | "ASSISTANT" | "SYSTEM";
   content: string;
   metadata?: any;
+  noticeKind?: NoticeKind;
+  retryAfterMs?: number | null;
+  quotaExplanation?: string;
+  freeTier?: boolean;
+  /** Answer came from a fallback model, or without the prose model at all. */
+  degraded?: boolean;
+  proseUnavailable?: boolean;
+  answerTruncated?: boolean;
+  proseSkippedForQuota?: boolean;
+  /** The steps DAVIS actually took, kept so the answer stays auditable. */
+  trace?: TraceEntry[];
+  thinkingMs?: number;
+}
+
+const NOTICE_STYLES: Record<
+  NoticeKind,
+  { border: string; label: string }
+> = {
+  overloaded: {
+    border: "border-warning/30 bg-warning/10 text-warning",
+    label: "Google's models are busy",
+  },
+  quota: {
+    border: "border-warning/30 bg-warning/10 text-warning",
+    label: "API quota reached",
+  },
+  failed: {
+    border: "border-danger/20 bg-danger/10 text-danger",
+    label: "Couldn't answer that reliably",
+  },
+  network: {
+    border: "border-danger/20 bg-danger/10 text-danger",
+    label: "Connection problem",
+  },
+  config: {
+    border: "border-danger/20 bg-danger/10 text-danger",
+    label: "Model not configured",
+  },
+  timeout: {
+    border: "border-warning/30 bg-warning/10 text-warning",
+    label: "DAVIS stopped waiting",
+  },
+};
+
+/** Live elapsed counter, so a long wait visibly progresses. */
+function useElapsed(active: boolean) {
+  const [ms, setMs] = useState(0);
+  const startRef = useRef<number>(0);
+  useEffect(() => {
+    if (!active) return;
+    startRef.current = Date.now();
+    setMs(0);
+    const id = setInterval(() => setMs(Date.now() - startRef.current), 100);
+    return () => clearInterval(id);
+  }, [active]);
+  return ms;
+}
+
+/** A step that took 41ms should say so, not "0.0s". */
+const secs = (ms: number) =>
+  ms < 1000 ? `${Math.max(0, Math.round(ms))}ms` : `${(ms / 1000).toFixed(1)}s`;
+
+/**
+ * The live "thinking" panel and, once finished, the collapsed summary.
+ *
+ * Every line comes from a server event describing work that actually ran —
+ * real table counts, the model that really served the call, real row counts,
+ * the real database error when a query had to be repaired. Nothing is invented
+ * to fill the silence; a progress display that fabricates activity would
+ * undermine trust in the numbers themselves.
+ *
+ * NOTE ON STYLING: this project has no Tailwind (no dependency, no config), so
+ * utility class names like `text-xs mt-3 shrink-0` are inert here. The styles
+ * live in globals.css under .thinking-*, alongside .chat-bubble.
+ */
+function ThinkingTrace({
+  trace,
+  live,
+  totalMs,
+}: {
+  trace: TraceEntry[];
+  live: boolean;
+  totalMs?: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const elapsed = useElapsed(live);
+
+  if (trace.length === 0 && !live) return null;
+
+  /* ---- Live: current step in focus, finished steps listed below ---- */
+  if (live) {
+    const active = trace.find((t) => t.running);
+    const done = trace.filter((t) => !t.running);
+    return (
+      <div className="thinking">
+        <div className="thinking-head">
+          <span className="typing-indicator">
+            <span /><span /><span />
+          </span>
+          <span className="thinking-label">
+            {active ? active.label : "Thinking"}
+          </span>
+          <span className="thinking-elapsed">{secs(elapsed)}</span>
+        </div>
+
+        {done.length > 0 && (
+          <ul className="thinking-steps">
+            {done.map((t, i) => (
+              <li className="thinking-step" key={`${t.id}-${i}`}>
+                <span className="thinking-tick">✓</span>
+                <span className="thinking-step-label">{t.label}</span>
+                {t.detail && (
+                  <span className="thinking-step-detail">{t.detail}</span>
+                )}
+                <span className="thinking-step-ms">{secs(t.ms)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    );
+  }
+
+  /* ---- Finished: one line, expandable ---- */
+  const total = totalMs ?? trace.reduce((n, t) => n + t.ms, 0);
+  return (
+    <div className="thinking-done">
+      <button
+        type="button"
+        className="thinking-toggle"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+      >
+        <span className={open ? "thinking-caret thinking-caret-open" : "thinking-caret"}>
+          &rsaquo;
+        </span>
+        Thought for {secs(total)}
+      </button>
+
+      {open && (
+        <ul className="thinking-steps thinking-steps-collapsed">
+          {trace.map((t, i) => (
+            <li className="thinking-step" key={`${t.id}-${i}`}>
+              <span className="thinking-step-label">{t.label}</span>
+              {t.detail && (
+                <span className="thinking-step-detail">{t.detail}</span>
+              )}
+              <span className="thinking-step-ms">{secs(t.ms)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function RetryCountdown({
+  retryAfterMs,
+  onRetry,
+  disabled,
+}: {
+  retryAfterMs?: number | null;
+  onRetry: () => void;
+  disabled: boolean;
+}) {
+  const [remaining, setRemaining] = useState(
+    retryAfterMs ? Math.ceil(retryAfterMs / 1000) : 0
+  );
+
+  useEffect(() => {
+    if (remaining <= 0) return;
+    const t = setTimeout(() => setRemaining((r) => r - 1), 1000);
+    return () => clearTimeout(t);
+  }, [remaining]);
+
+  return (
+    <button
+      type="button"
+      onClick={onRetry}
+      disabled={disabled || remaining > 0}
+      className="mt-3 text-xs font-medium px-3 py-1.5 rounded-md border border-current/30 hover:bg-current/10 disabled:opacity-50 transition-colors"
+    >
+      {remaining > 0 ? `Retry in ${remaining}s` : "Retry this question"}
+    </button>
+  );
 }
 
 export default function DataChatPage() {
@@ -20,6 +236,9 @@ export default function DataChatPage() {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [lastQuestion, setLastQuestion] = useState<string>("");
+  /** Stages for the request currently in flight. */
+  const [liveTrace, setLiveTrace] = useState<TraceEntry[]>([]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -42,60 +261,199 @@ export default function DataChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  const send = useCallback(
+    async (question: string, opts: { echoUser?: boolean } = {}) => {
+      if (!question.trim() || !selectedDb || isLoading) return;
+
+      if (opts.echoUser !== false) {
+        setMessages(prev => [
+          ...prev,
+          { id: `u-${Date.now()}`, role: "USER", content: question },
+        ]);
+      }
+
+      setLastQuestion(question);
+      setIsLoading(true);
+
+      setLiveTrace([]);
+      const requestStartedAt = Date.now();
+      // Collected from the stream so the finished message can keep the trace.
+      const collected: TraceEntry[] = [];
+
+      /** Turn a final payload into a chat message. Shared by ok and error. */
+      const settle = (status: number, data: any) => {
+        const elapsed = Date.now() - requestStartedAt;
+        const trace: TraceEntry[] =
+          (Array.isArray(data?.trace) && data.trace.length
+            ? data.trace
+            : collected.filter((t) => !t.running)) || [];
+
+        if (status < 400) {
+          if (!sessionId && data.sessionId) setSessionId(data.sessionId);
+          setMessages(prev => [
+            ...prev,
+            {
+              id: data.messageId || `a-${Date.now()}`,
+              role: "ASSISTANT",
+              content: data.message,
+              metadata: {
+                status: data.status,
+                sql: data.sql,
+                assumptions: data.assumptions,
+                rowCount: data.rowCount,
+              },
+              degraded: Boolean(data.degraded),
+              proseUnavailable: Boolean(data.proseUnavailable),
+              answerTruncated: Boolean(data.answerTruncated),
+              proseSkippedForQuota: Boolean(data.proseSkippedForQuota),
+              noticeKind: data.code === "QUERY_FAILED" ? "failed" : undefined,
+              trace,
+              thinkingMs: elapsed,
+            },
+          ]);
+          return;
+        }
+
+        const kind: NoticeKind =
+          data?.code === "PROVIDER_OVERLOADED"
+            ? "overloaded"
+            : data?.code === "QUOTA_EXCEEDED"
+            ? "quota"
+            : data?.code === "MODEL_CONFIGURATION"
+            ? "config"
+            : data?.code === "LOCAL_TIMEOUT"
+            ? "timeout"
+            : "failed";
+
+        setMessages(prev => [
+          ...prev,
+          {
+            id: `e-${Date.now()}`,
+            role: "SYSTEM",
+            content: data?.error || "Something went wrong.",
+            noticeKind: kind,
+            retryAfterMs: data?.retryAfterMs ?? null,
+            quotaExplanation: data?.quotaExplanation,
+            freeTier: Boolean(data?.freeTier),
+            trace,
+            thinkingMs: elapsed,
+          },
+        ]);
+      };
+
+      const apply = (evt: any) => {
+        if (evt.t === "stage") {
+          collected.push({ id: evt.id, label: evt.label, ms: 0, running: true });
+          setLiveTrace([...collected]);
+        } else if (evt.t === "stage_end") {
+          // validate/repair can repeat, so close the most recent open entry
+          // with this id rather than the first.
+          for (let i = collected.length - 1; i >= 0; i--) {
+            if (collected[i].id === evt.id && collected[i].running) {
+              collected[i] = {
+                ...collected[i],
+                detail: evt.detail,
+                ms: evt.ms,
+                running: false,
+              };
+              break;
+            }
+          }
+          setLiveTrace([...collected]);
+        } else if (evt.t === "done" || evt.t === "error") {
+          settle(evt.status, evt.body);
+        }
+      };
+
+      try {
+        const res = await fetch("/api/chat/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question,
+            connectionId: selectedDb,
+            sessionId,
+            stream: true,
+          }),
+        });
+
+        // A non-streaming response can still arrive (auth redirect, bad JSON
+        // body, a proxy that strips streaming) — handle it rather than hanging.
+        const contentType = res.headers.get("content-type") || "";
+        if (!res.body || !contentType.includes("ndjson")) {
+          const data = await res.json().catch(() => ({
+            error: "The server returned an unreadable response.",
+          }));
+          settle(res.status, data);
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          // NDJSON: complete lines only; the tail may be a partial event.
+          let nl: number;
+          while ((nl = buffer.indexOf("\n")) >= 0) {
+            const line = buffer.slice(0, nl).trim();
+            buffer = buffer.slice(nl + 1);
+            if (!line) continue;
+            try {
+              apply(JSON.parse(line));
+            } catch {
+              /* ignore a malformed line rather than dropping the stream */
+            }
+          }
+        }
+
+        const tail = buffer.trim();
+        if (tail) {
+          try {
+            apply(JSON.parse(tail));
+          } catch {
+            /* nothing usable in the tail */
+          }
+        }
+      } catch (err) {
+        setMessages(prev => [
+          ...prev,
+          {
+            id: `e-${Date.now()}`,
+            role: "SYSTEM",
+            content:
+              "Couldn't reach the server. Check your connection and try again.",
+            noticeKind: "network",
+          },
+        ]);
+      } finally {
+        setIsLoading(false);
+        setLiveTrace([]);
+      }
+    },
+    [selectedDb, isLoading, sessionId]
+  );
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || !selectedDb || isLoading) return;
-
-    const userMsg: Message = {
-      id: Date.now().toString(),
-      role: "USER",
-      content: input
-    };
-
-    setMessages(prev => [...prev, userMsg]);
+    const q = input;
     setInput("");
-    setIsLoading(true);
-
-    try {
-      const res = await fetch("/api/chat/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question: userMsg.content,
-          connectionId: selectedDb,
-          sessionId
-        }),
-      });
-
-      const data = await res.json();
-
-      if (res.ok) {
-        if (!sessionId) setSessionId(data.sessionId);
-
-        const assistantMsg: Message = {
-          id: data.messageId,
-          role: "ASSISTANT",
-          content: data.message,
-          metadata: { status: "success" }
-        };
-        setMessages(prev => [...prev, assistantMsg]);
-      } else {
-        setMessages(prev => [...prev, {
-          id: Date.now().toString(),
-          role: "SYSTEM",
-          content: `Error: ${data.error}`
-        }]);
-      }
-    } catch (err) {
-      setMessages(prev => [...prev, {
-        id: Date.now().toString(),
-        role: "SYSTEM",
-        content: "Network error occurred."
-      }]);
-    } finally {
-      setIsLoading(false);
-    }
+    await send(q);
   };
+
+  const retry = useCallback(() => {
+    // Drop the notice, then re-ask without duplicating the user's bubble.
+    setMessages(prev => {
+      const next = [...prev];
+      while (next.length && next[next.length - 1].role === "SYSTEM") next.pop();
+      return next;
+    });
+    void send(lastQuestion, { echoUser: false });
+  }, [lastQuestion, send]);
 
   return (
     <div className="flex flex-col h-[calc(100vh-4rem)] bg-bg-main relative">
@@ -127,7 +485,7 @@ export default function DataChatPage() {
       </div>
 
       {/* Chat Messages Area */}
-      <div className="flex-1 overflow-y-auto py-6 space-y-6 scrollbar-hide">
+      <div className="flex-1 overflow-y-auto py-6 chat-stream scrollbar-hide">
         {messages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-center px-4">
             <div className="w-16 h-16 rounded-full bg-brand-primary/10 flex items-center justify-center text-brand-light mb-4 shadow-glow">
@@ -138,41 +496,123 @@ export default function DataChatPage() {
             <h2 className="text-xl font-bold mb-2">How can I help you analyze your data?</h2>
           </div>
         ) : (
-          messages.map(msg => (
-            <div key={msg.id} className={`flex ${msg.role === "USER" ? "justify-end" : "justify-start"}`}>
-              <div className={`max-w-[80%] rounded-2xl p-5 ${msg.role === "USER"
-                ? "bg-brand-primary text-white shadow-md rounded-tr-sm"
-                : msg.role === "SYSTEM"
-                  ? "bg-danger/10 border border-danger/20 text-danger"
-                  : "bg-bg-surface border border-border-subtle shadow-sm rounded-tl-sm"
-                }`} style={{ borderRadius: "var(--radius-lg)", backgroundColor: "#363737", padding: "0.5rem" }}>
-                {/* Regular content */}
-                <div className="text-sm">
-                  {msg.role === "ASSISTANT" ? (
-                    <div className="markdown-content prose-sm max-w-none text-inherit [&>ul]:list-disc [&>ul]:ml-4 [&>ul]:my-2 [&>p]:mb-2 last:[&>p]:mb-0 [&>strong]:font-bold">
-                      <ReactMarkdown>
-                        {msg.content}
-                      </ReactMarkdown>
-                    </div>
-                  ) : (
-                    <p className="whitespace-pre-wrap">{msg.content}</p>
-                  )}
+          messages.map(msg => {
+            /* --- Notices get their own treatment, not a chat bubble --- */
+            if (msg.role === "SYSTEM" && msg.noticeKind) {
+              const style = NOTICE_STYLES[msg.noticeKind];
+              const retryable =
+                msg.noticeKind === "overloaded" ||
+                msg.noticeKind === "network" ||
+                msg.noticeKind === "timeout";
+
+              return (
+                <div key={msg.id} className="flex justify-start">
+                  <div
+                    className={`max-w-[80%] rounded-2xl border p-4 ${style.border}`}
+                    style={{ borderRadius: "var(--radius-lg)" }}
+                  >
+                    <p className="text-xs font-semibold uppercase tracking-wide opacity-80">
+                      {style.label}
+                    </p>
+                    <p className="text-sm mt-1 opacity-95">{msg.content}</p>
+
+                    {msg.noticeKind === "config" && (
+                      <p className="text-xs mt-2 opacity-75">
+                        Retrying won&apos;t help — a configured model ID is wrong,
+                        retired, or not granted to this API key. Check the server
+                        logs, or open <code>/api/ai/models</code> to see which
+                        models the key can actually reach.
+                      </p>
+                    )}
+
+                    {msg.noticeKind === "quota" && (
+                      <div className="text-xs mt-2 opacity-75 space-y-1">
+                        {msg.quotaExplanation && <p>{msg.quotaExplanation}</p>}
+                        <p>
+                          {msg.freeTier
+                            ? "The free tier allows only a handful of requests per minute. Enabling billing on the Google Cloud project moves this key to Tier 1, which has far higher limits and no minimum spend."
+                            : "This is a limit on this deployment's Gemini key, not on your question. It resets on its own."}
+                        </p>
+                      </div>
+                    )}
+
+                    {msg.trace && msg.trace.length > 0 && (
+                      <ThinkingTrace
+                        trace={msg.trace}
+                        live={false}
+                        totalMs={msg.thinkingMs}
+                      />
+                    )}
+
+                    {retryable && lastQuestion && (
+                      <RetryCountdown
+                        retryAfterMs={msg.retryAfterMs}
+                        onRetry={retry}
+                        disabled={isLoading}
+                      />
+                    )}
+                  </div>
+                </div>
+              );
+            }
+
+            const isUser = msg.role === "USER";
+
+            return (
+              <div key={msg.id} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+                {/* Assistant bubbles run wider than user bubbles: a result table
+                    needs the room, and squeezing one into 80% forces every cell
+                    to wrap. */}
+                <div
+                  className={`chat-bubble ${
+                    isUser ? "chat-bubble-user max-w-[80%]" : "chat-bubble-assistant max-w-[92%]"
+                  }`}
+                >
+                  <div className="text-sm">
+                    {msg.role === "ASSISTANT" && msg.trace && msg.trace.length > 0 && (
+                      <ThinkingTrace
+                        trace={msg.trace}
+                        live={false}
+                        totalMs={msg.thinkingMs}
+                      />
+                    )}
+                    {msg.role === "ASSISTANT" ? (
+                      <div className="markdown-content">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {msg.content}
+                        </ReactMarkdown>
+                      </div>
+                    ) : (
+                      <p className="whitespace-pre-wrap">{msg.content}</p>
+                    )}
+                  </div>
+
+                  {/* Quiet footer when the answer came from a fallback path,
+                      so a degraded answer is never mistaken for a normal one. */}
+                  {msg.role === "ASSISTANT" &&
+                    (msg.degraded ||
+                      msg.proseUnavailable ||
+                      msg.answerTruncated ||
+                      msg.proseSkippedForQuota) && (
+                      <p className="text-[11px] mt-3 text-text-muted italic">
+                        {msg.proseSkippedForQuota
+                          ? "Written summary skipped to conserve API quota — figures are verified."
+                          : msg.answerTruncated
+                          ? "Full result shown directly — the written summary ran long."
+                          : msg.proseUnavailable
+                          ? "Figures verified from your database; written summary unavailable."
+                          : "Answered with a fallback model while the primary one was busy."}
+                      </p>
+                    )}
                 </div>
               </div>
-            </div>
-          ))
+            );
+          })
         )}
 
-        {/* Loading Indicator for User Input */}
-        {isLoading && !messages.find(m => m.metadata?.status === "executing") && (
-          <div className="flex justify-start">
-            <div className="bg-bg-surface border border-border-subtle shadow-sm rounded-2xl rounded-tl-sm p-5 w-24 flex items-center justify-center">
-              <div className="typing-indicator scale-125 m-0">
-                <span /><span /><span />
-              </div>
-            </div>
-          </div>
-        )}
+        {/* Live progress. Replaces the bare spinner: at 20-30s per question a
+            dot animation gives no sense that anything is happening. */}
+        {isLoading && <ThinkingTrace trace={liveTrace} live />}
 
         <div ref={messagesEndRef} />
       </div>

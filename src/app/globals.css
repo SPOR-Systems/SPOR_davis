@@ -1228,3 +1228,387 @@ select.input {
     grid-template-columns: repeat(2, 1fr);
   }
 }
+
+/* ==========================================================================
+   CHAT BUBBLES + RENDERED MARKDOWN
+   --------------------------------------------------------------------------
+   DAVIS answers data questions with markdown — tables for multi-row results,
+   lists for rankings, fenced SQL when asked how it got a number. None of that
+   had any styling, so a correct answer looked broken.
+
+   Everything below uses the design tokens declared at the top of this file so
+   the chat matches the rest of the app.
+   ========================================================================== */
+
+.chat-bubble {
+  padding: 1rem;
+  border-radius: var(--radius-lg);
+  padding: var(--space-4, 1rem) var(--space-5, 1.25rem);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  min-width: 0;
+  /* lets the overflow container inside actually clamp */
+}
+
+.chat-bubble-user {
+  padding: 1rem;
+  background: var(--brand-primary);
+  color: #fff;
+  border-top-right-radius: var(--radius-sm, 0.25rem);
+}
+
+.chat-bubble-assistant {
+  padding: 1rem;
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  border-top-left-radius: var(--radius-sm, 0.25rem);
+}
+
+/* --- Block spacing: first and last child never add outer margin, so the
+       bubble padding stays even. --- */
+.markdown-content>*:first-child {
+  margin-top: 0;
+}
+
+.markdown-content>*:last-child {
+  margin-bottom: 0;
+}
+
+.markdown-content p {
+  margin: 0 0 0.75em;
+  line-height: 1.6;
+}
+
+.markdown-content strong {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.markdown-content em {
+  font-style: italic;
+}
+
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3,
+.markdown-content h4 {
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 1.2em 0 0.5em;
+  color: var(--text-primary);
+}
+
+.markdown-content h1 {
+  font-size: 1.15rem;
+}
+
+.markdown-content h2 {
+  font-size: 1.05rem;
+}
+
+.markdown-content h3,
+.markdown-content h4 {
+  font-size: 0.95rem;
+}
+
+.markdown-content ul,
+.markdown-content ol {
+  margin: 0.5em 0 0.85em;
+  padding-left: 1.35em;
+}
+
+.markdown-content ul {
+  list-style: disc;
+}
+
+.markdown-content ol {
+  list-style: decimal;
+}
+
+.markdown-content li {
+  margin: 0.25em 0;
+  line-height: 1.55;
+}
+
+.markdown-content li>ul,
+.markdown-content li>ol {
+  margin: 0.25em 0;
+}
+
+/* --- Tables -------------------------------------------------------------
+   A result set can be wider than the bubble. Scroll it inside its own
+   container rather than letting it stretch the message or the page.
+   ---------------------------------------------------------------------- */
+.markdown-content table {
+  display: block;
+  /* required for overflow to take effect */
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 0.85em 0;
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.markdown-content thead {
+  background: var(--bg-surface-hover);
+}
+
+.markdown-content th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.markdown-content td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border-subtle);
+  vertical-align: top;
+  color: var(--text-primary);
+}
+
+/* Numeric columns read far better right-aligned. Markdown carries alignment
+   through text-align, so honour it when the model emits `|---:|`. */
+.markdown-content td[align="right"],
+.markdown-content th[align="right"] {
+  text-align: right;
+}
+
+.markdown-content td[align="center"],
+.markdown-content th[align="center"] {
+  text-align: center;
+}
+
+.markdown-content tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.markdown-content tbody tr:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+/* --- Code -------------------------------------------------------------- */
+.markdown-content code {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.8125rem;
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm, 0.25rem);
+  padding: 0.1em 0.35em;
+}
+
+.markdown-content pre {
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md, 0.5rem);
+  padding: 0.85rem 1rem;
+  margin: 0.85em 0;
+  overflow-x: auto;
+  line-height: 1.5;
+}
+
+/* A fenced block should not double up the inline pill styling. */
+.markdown-content pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.8125rem;
+  white-space: pre;
+}
+
+/* --- Misc -------------------------------------------------------------- */
+.markdown-content a {
+  color: var(--brand-light);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown-content blockquote {
+  margin: 0.85em 0;
+  padding: 0.25em 0 0.25em 0.9em;
+  border-left: 2px solid var(--border-default);
+  color: var(--text-secondary);
+}
+
+.markdown-content hr {
+  border: none;
+  border-top: 1px solid var(--border-subtle);
+  margin: 1.1em 0;
+}
+
+/* ==========================================================================
+   THINKING TRACE
+   --------------------------------------------------------------------------
+   Live progress while DAVIS works, then a collapsed "Thought for 27s" line.
+
+   Written as real CSS on purpose: this project has no Tailwind dependency and
+   no config, so utility class names such as `text-xs mt-3 shrink-0 ml-auto`
+   do nothing here. Everything below uses the design tokens at the top of this
+   file.
+   ========================================================================== */
+
+/* The message stream. `space-y-6` in the markup is a Tailwind utility, and
+   Tailwind is not installed in this project, so it never applied and NOTHING
+   separated the message rows — the thinking panel just made it obvious. This
+   is the real version of what that class was meant to do. */
+.chat-stream {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.thinking {
+  /* Roomier than a chat bubble: this is a list, and cramped rows are hard to
+     scan while they are still changing. All four sides — a vertical-only
+     padding leaves the text flush against the border. */
+  padding: var(--space-5) var(--space-5) var(--space-4);
+  /* Slightly more separation than the stream gap alone, since this panel
+     appears and disappears rather than sitting in the transcript. */
+  margin-block: var(--space-2);
+  align-self: flex-start;
+  max-width: 92%;
+  min-width: min(340px, 100%);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  animation: fadeIn 0.2s ease-out;
+}
+
+.thinking-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding-bottom: var(--space-1);
+}
+
+/* The indicator is sized for a bubble elsewhere; keep it inline here. */
+.thinking .typing-indicator {
+  margin: 0;
+  flex-shrink: 0;
+}
+
+.thinking-label {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.thinking-elapsed {
+  margin-left: auto;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.thinking-steps {
+  list-style: none;
+  margin: var(--space-3) 0 0;
+  padding: var(--space-3) 0 0;
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.thinking-steps-collapsed {
+  margin-top: var(--space-2);
+  padding: 0 0 0 var(--space-3);
+  border-top: none;
+  border-left: 1px solid var(--border-subtle);
+  gap: var(--space-1);
+}
+
+.thinking-step {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+  animation: fadeIn 0.18s ease-out;
+}
+
+.thinking-tick {
+  color: var(--success);
+  flex-shrink: 0;
+}
+
+.thinking-step-label {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+/* The measured fact for the step. Allowed to wrap; never pushes the timing
+   column off the row. */
+.thinking-step-detail {
+  opacity: 0.75;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.thinking-step-detail::before {
+  content: "— ";
+}
+
+.thinking-step-ms {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.6;
+  flex-shrink: 0;
+  padding-left: 0.4rem;
+}
+
+/* --- Collapsed summary --- */
+.thinking-done {
+  margin-bottom: var(--space-3);
+}
+
+.thinking-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  transition: color 0.15s ease;
+}
+
+.thinking-toggle:hover {
+  color: var(--text-secondary);
+}
+
+.thinking-caret {
+  display: inline-block;
+  transition: transform 0.15s ease;
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
+.thinking-caret-open {
+  transform: rotate(90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+
+  .thinking,
+  .thinking-step {
+    animation: none;
+  }
+
+  .thinking-caret,
+  .thinking-toggle {
+    transition: none;
+  }
+}

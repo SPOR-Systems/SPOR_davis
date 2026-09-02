@@ -1,134 +1,554 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import {
+  buildAnswerPrompt,
+  buildNonDataPrompt,
+  buildRepairPrompt,
+  buildSqlPrompt,
+  PROMPT_VERSION,
+} from "@/lib/ai/prompts";
+import {
+  callWithFallback,
+  ModelConfigurationError,
+  modelHealth,
+  parseChain,
+  rateLimiterStats,
+  warnIfChainExceedsBudget,
+  type CallMeta,
+} from "@/lib/ai/resilience";
 
 const API_KEY = process.env.GEMINI_API_KEY || "";
-const genAI = new GoogleGenerativeAI(API_KEY);
+const ai = new GoogleGenAI({ apiKey: API_KEY });
 
-// We will use gemini-3.1-flash-lite for speed and SQL reasoning
-const model = genAI.getGenerativeModel({ model: "gemini-3.1-flash-lite" });
+/**
+ * ============================================================================
+ *  MODEL CONFIGURATION
+ * ============================================================================
+ *  Two chains, ordered strongest-first. On a 503 we walk down the chain rather
+ *  than failing the question, so an overload degrades answer quality instead of
+ *  breaking the feature.
+ *
+ *  SQL planning is the hard reasoning step and gets gemini-3.7-flash: stable,
+ *  built for complex coding and multi-step execution, with thinking turned up.
+ *  Preview model IDs are deliberately absent from the default chain — preview
+ *  tiers get a fraction of the served capacity and are where 503 storms live.
+ *
+ *  Answer rendering does no arithmetic (every figure is precomputed in
+ *  facts.ts), so it stays on the cheap lite tier with thinking turned down.
+ * ============================================================================
+ */
 
-export interface GenerateSQLParams {
-  question: string;
-  schema: string;
-  dialect: string; // e.g. "PostgreSQL", "MySQL"
-  chatHistory?: string;
-}
+/**
+ * Chain order is deliberate: the fallback exists BECAUSE the primary ran out of
+ * capacity, so falling back to another capacity-constrained model is no help.
+ * Each step down trades reasoning depth for available throughput, and the last
+ * entry is the tier with the most spare capacity.
+ *
+ * gemini-2.5-pro is deliberately NOT here: it returns 404 "no longer available
+ * to new users" on keys that never used it, which makes it a worse-than-useless
+ * fallback. If you want a Pro-tier fallback, gemini-3.1-pro-preview is the
+ * current one — but it is preview, so it is the least likely to have spare
+ * capacity during exactly the overload you are falling back from.
+ */
+const SQL_MODEL_CHAIN = parseChain(process.env.DAVIS_SQL_MODEL_CHAIN, [
+  "gemini-3.7-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+]);
 
-async function withRetry<T>(operation: () => Promise<T>, maxRetries = 3): Promise<T> {
-  let attempt = 0;
-  while (attempt < maxRetries) {
-    try {
-      return await operation();
-    } catch (error: any) {
-      if ((error.message?.includes("503") || error.message?.includes("429") || error.message?.includes("500") || error.message?.includes("unavailable")) && attempt < maxRetries - 1) {
-        const delay = Math.pow(2, attempt) * 1000;
-        console.log(`API overloaded. Retrying in ${delay}ms... (Attempt ${attempt + 1})`);
-        await new Promise(res => setTimeout(res, delay));
-        attempt++;
-      } else {
-        throw error;
-      }
-    }
+const PROSE_MODEL_CHAIN = parseChain(process.env.DAVIS_PROSE_MODEL_CHAIN, [
+  "gemini-3.1-flash-lite",
+  "gemini-3.5-flash-lite",
+]);
+
+/**
+ * Ceiling on any single call. The ACTUAL timeout for each attempt is the
+ * smaller of this and the model's remaining slice of the request budget.
+ *
+ * These were 12s/10s, chosen on the assumption that "a healthy high-thinking
+ * plan comes back well inside it". That assumption was wrong and unverified:
+ * thinkingLevel HIGH over a ~2k-token schema document, with thinking tokens
+ * counting against an 8192 output budget, can legitimately run 20-40s. The
+ * tight ceiling was aborting calls that would have succeeded and then blaming
+ * the provider for it.
+ *
+ * Every call now logs its duration, so set these from your own numbers rather
+ * than from a guess. If planning is consistently slow, the cheapest latency
+ * lever is DAVIS_SQL_THINKING_LEVEL=medium.
+ */
+const SQL_CALL_TIMEOUT_MS = Number(process.env.DAVIS_SQL_CALL_TIMEOUT_MS || 45_000);
+
+/**
+ * Output budget for the planner. THINKING TOKENS COUNT AGAINST THIS. At
+ * thinkingLevel HIGH over a couple of thousand tokens of schema, 8192 was not
+ * enough: the model spent most of it thinking and the JSON came back cut off
+ * mid-object, which surfaced as a bare "unparseable response".
+ */
+const SQL_MAX_OUTPUT_TOKENS = Number(
+  process.env.DAVIS_SQL_MAX_OUTPUT_TOKENS || 32_768
+);
+const PROSE_CALL_TIMEOUT_MS = Number(process.env.DAVIS_PROSE_CALL_TIMEOUT_MS || 25_000);
+
+/**
+ * NOTE ON TEMPERATURE — read before adding one back.
+ *
+ * We deliberately do NOT set temperature. Google's Gemini 3 guidance is to
+ * leave it at the default of 1.0, because lowering it on a thinking model "may
+ * lead to unexpected behavior, such as looping or degraded performance".
+ *
+ * On this model generation, determinism comes from thinkingLevel plus a strict
+ * output contract, not from clamping the sampler.
+ */
+
+function thinkingLevelFromEnv(
+  envValue: string | undefined,
+  fallback: ThinkingLevel
+): ThinkingLevel {
+  switch (String(envValue || "").toLowerCase()) {
+    case "minimal":
+      return ThinkingLevel.MINIMAL;
+    case "low":
+      return ThinkingLevel.LOW;
+    case "medium":
+      return ThinkingLevel.MEDIUM;
+    case "high":
+      return ThinkingLevel.HIGH;
+    default:
+      return fallback;
   }
-  throw new Error("Max retries reached");
 }
 
-export async function generateSQLQuery({ question, schema, dialect, chatHistory }: GenerateSQLParams): Promise<string> {
-  const prompt = `
-You are an expert Data Analyst and SQL Developer.
-Your task is to translate a natural language question into a valid ${dialect} SQL query.
+const SQL_THINKING = thinkingLevelFromEnv(
+  process.env.DAVIS_SQL_THINKING_LEVEL,
+  ThinkingLevel.HIGH
+);
+const PROSE_THINKING = thinkingLevelFromEnv(
+  process.env.DAVIS_PROSE_THINKING_LEVEL,
+  ThinkingLevel.LOW
+);
 
---- DATABASE SCHEMA ---
-${schema}
------------------------
+// Surface an unreachable chain tail at startup rather than leaving it to be
+// discovered during an outage.
+warnIfChainExceedsBudget(SQL_MODEL_CHAIN, undefined, "SQL chain");
+warnIfChainExceedsBudget(PROSE_MODEL_CHAIN, undefined, "prose chain");
 
---- INSTRUCTIONS ---
-1. Analyze the user's question and the provided database schema.
-2. If the user refers to previous context (e.g., "what about next week", "who were they"), refer to the CHAT HISTORY to resolve it.
-3. Write a valid ${dialect} SQL query to answer the question.
-4. ALWAYS use fully qualified table names or aliases if joining.
-5. Ensure the query is read-only (SELECT statements only). Never generate INSERT, UPDATE, DELETE, or DROP.
-6. You MUST return ONLY the raw SQL query. Do not wrap it in markdown code blocks (\`\`\`sql ... \`\`\`). Do not include any explanations or conversational text. Just the exact SQL string that can be executed directly.
-7. Limit results to a reasonable amount if not specified (e.g., LIMIT 100).
-8. When answering questions about the 'most common', 'top', or similar superlatives, DO NOT use LIMIT 1. Always return multiple rows so ties can be detected.
-9. SQLite Date Arithmetic: SQLite stores dates as strings. To calculate age or date differences, strictly use standard SQLite date functions like \`CAST(strftime('%Y', 'now') - strftime('%Y', PT_DOB_DT) AS INTEGER)\`.
-10. Avoid manual calculations if a pre-calculated column exists.
-11. Be extremely careful when joining tables. Always follow the explicit foreign key relationships defined in the schema to avoid accidentally dropping rows.
-12. ALL math and aggregations (SUM, COUNT, AVG, MIN, MAX) MUST be performed within the SQL query itself. DO NOT return raw rows expecting the downstream application to calculate it.
-13. Pay extremely close attention to explicit filters and adjectives in the user's question (e.g., "paid", "completed", "active"). You MUST apply a WHERE clause to filter the rows. Do not assume that selecting a specific column fulfills a row filter condition.
-14. If you are unsure of the exact categorical string value in the database for a filter, use a case-insensitive LIKE clause (e.g., \`WHERE CLM_STAT_CD LIKE '%PAID%'\` or \`WHERE ENC_STAT_CD LIKE '%COMPLETED%'\`).
-15. DO NOT BE LAZY. You must be correct. Check your work if needed.
-16. If the user's question is a follow-up asking for clarification, explanation, or confirmation (e.g., "what SQL did you use?", "are you sure?"), DO NOT write a new query from scratch. Instead, extract and return the EXACT SAME SQL query that was executed in the previous ASSISTANT response, which is provided in the Chat History as [Previously Executed SQL: ...].
---- CHAT HISTORY (For context only) ---
-${chatHistory || "No previous history."}
+export const AI_CONFIG = {
+  promptVersion: PROMPT_VERSION,
+  sqlModelChain: SQL_MODEL_CHAIN,
+  proseModelChain: PROSE_MODEL_CHAIN,
+  sqlThinking: SQL_THINKING,
+  proseThinking: PROSE_THINKING,
+};
 
---- USER QUESTION ---
-${question}
+/**
+ * The model hit its output ceiling mid-sentence. The answer that came back is
+ * literally incomplete — a half-written table row — so it must never be shown.
+ * The caller falls back to the deterministic renderer, which is always whole.
+ */
+export class OutputTruncatedError extends Error {
+  readonly code = "OUTPUT_TRUNCATED";
+  constructor(model: string) {
+    super(`${model} hit its output token limit before finishing the answer.`);
+    this.name = "OutputTruncatedError";
+  }
+}
 
---- SQL QUERY (RAW STRING ONLY) ---
-`;
+/* -------------------------------------------------------------------------- */
+/* Model discovery + diagnostics                                              */
+/* -------------------------------------------------------------------------- */
+
+let availableModelsCache: { models: string[]; fetchedAt: number } | null = null;
+const MODEL_LIST_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * What this API key can actually reach. Model IDs shift under you — retirements
+ * and "not available to new users" gates are invisible until a call 404s — so
+ * when a chain fails we look this up and log it, turning a mystery 404 into a
+ * list of IDs that would have worked.
+ */
+export async function listAvailableModels(
+  opts: { force?: boolean } = {}
+): Promise<string[]> {
+  if (
+    !opts.force &&
+    availableModelsCache &&
+    Date.now() - availableModelsCache.fetchedAt < MODEL_LIST_TTL_MS
+  ) {
+    return availableModelsCache.models;
+  }
+
+  const models: string[] = [];
+  try {
+    const pager = await ai.models.list();
+    for await (const m of pager) {
+      if (m.name) models.push(m.name.replace(/^models\//, ""));
+      if (models.length >= 200) break; // guard against a runaway pager
+    }
+    availableModelsCache = { models, fetchedAt: Date.now() };
+  } catch (error: any) {
+    console.error(
+      "[davis] could not list available models:",
+      error?.message || error
+    );
+  }
+  return models;
+}
+
+/**
+ * Wraps a chain call so that a configuration failure explains itself. Without
+ * this, "none of the configured models are usable" leaves you guessing which
+ * IDs to try next.
+ */
+async function withModelDiagnostics<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error: any) {
+    if (error instanceof ModelConfigurationError) {
+      const available = await listAvailableModels();
+      console.error(
+        "[davis] MODEL CONFIGURATION PROBLEM\n" +
+          `  configured: ${error.modelsTried.join(", ")}\n` +
+          `  rejected because: ${JSON.stringify(error.reasons, null, 2)}\n` +
+          (available.length
+            ? `  models this API key CAN use: ${available.join(", ")}`
+            : "  (could not retrieve the list of usable models)")
+      );
+    }
+    throw error;
+  }
+}
+
+/** For the /api/ai/models diagnostics route. */
+export async function aiDiagnostics() {
+  return {
+    promptVersion: PROMPT_VERSION,
+    chains: { sql: SQL_MODEL_CHAIN, prose: PROSE_MODEL_CHAIN },
+    thinking: { sql: SQL_THINKING, prose: PROSE_THINKING },
+    timeouts: { sqlCallMs: SQL_CALL_TIMEOUT_MS, proseCallMs: PROSE_CALL_TIMEOUT_MS },
+    health: modelHealth(),
+    rateLimiter: rateLimiterStats(),
+    availableModels: await listAvailableModels({ force: true }),
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Transport                                                                  */
+/* -------------------------------------------------------------------------- */
+
+async function generateJson(
+  chain: string[],
+  prompt: string,
+  label: string
+): Promise<{ text: string; meta: CallMeta }> {
+  /**
+   * One attempt at the planner. `relief` is set on the retry after a
+   * truncation: thinking is dialled down so the token budget goes to the answer
+   * rather than to deliberation.
+   */
+  const attempt = async (relief: boolean) =>
+    withModelDiagnostics(() =>
+      callWithFallback(
+        chain,
+        async (model, ctx) => {
+          const response = await ai.models.generateContent({
+            model,
+            contents: prompt,
+            config: {
+              responseMimeType: "application/json",
+              maxOutputTokens: relief
+                ? SQL_MAX_OUTPUT_TOKENS * 2
+                : SQL_MAX_OUTPUT_TOKENS,
+              thinkingConfig: {
+                thinkingLevel: relief ? ThinkingLevel.MEDIUM : SQL_THINKING,
+              },
+              // The timeout comes from the caller's remaining time budget, not
+              // a fixed constant — that is what makes the deadline enforceable
+              // and lets a hedged loser be abandoned immediately.
+              httpOptions: { timeout: ctx.timeoutMs },
+              abortSignal: ctx.signal,
+            },
+          });
+
+          // Same check the prose path has had. Its absence here is why a
+          // truncated plan surfaced as a meaningless "unparseable response".
+          const finish = response.candidates?.[0]?.finishReason;
+          if (finish === "MAX_TOKENS") {
+            const usage = response.usageMetadata;
+            console.error(
+              `[davis] ${label}: ${model} hit its output ceiling. ` +
+                `thoughts=${usage?.thoughtsTokenCount ?? "?"} ` +
+                `output=${usage?.candidatesTokenCount ?? "?"} ` +
+                `ceiling=${relief ? SQL_MAX_OUTPUT_TOKENS * 2 : SQL_MAX_OUTPUT_TOKENS}. ` +
+                "Thinking tokens count against this budget — raise " +
+                "DAVIS_SQL_MAX_OUTPUT_TOKENS or lower DAVIS_SQL_THINKING_LEVEL."
+            );
+            throw new OutputTruncatedError(model);
+          }
+
+          const text = response.text;
+          if (!text) throw new Error("Empty response from model.");
+          return text;
+        },
+        { perCallCapMs: SQL_CALL_TIMEOUT_MS },
+        label
+      )
+    );
 
   try {
-    const result = await withRetry(() => model.generateContent(prompt));
-    const response = await result.response;
-    let sqlText = response.text().trim();
-
-    // Strip markdown formatting if the model disobeys rule 5
-    if (sqlText.startsWith("```sql")) {
-      sqlText = sqlText.replace(/^```sql/, "").replace(/```$/, "").trim();
-    } else if (sqlText.startsWith("```")) {
-      sqlText = sqlText.replace(/^```/, "").replace(/```$/, "").trim();
-    }
-
-    return sqlText;
+    const { value, meta } = await attempt(false);
+    return { text: value, meta };
   } catch (error: any) {
-    console.error("Gemini SQL Generation Error:", error.message || error);
-    throw new Error("Failed to generate SQL query.");
+    if (!(error instanceof OutputTruncatedError)) throw error;
+    console.warn(
+      `[davis] ${label}: retrying once with a doubled output budget and ` +
+        "medium thinking, so the tokens go to the plan instead of deliberation"
+    );
+    const { value, meta } = await attempt(true);
+    return { text: value, meta };
   }
+}
+
+async function generateText(
+  chain: string[],
+  prompt: string,
+  label: string
+): Promise<{ text: string; meta: CallMeta }> {
+  const { value, meta } = await withModelDiagnostics(() => callWithFallback(
+    chain,
+    async (model, ctx) => {
+      const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          // Room for a real table. Thinking tokens count against this too, so
+          // the old 2048 was cutting long answers off mid-row.
+          maxOutputTokens: 4096,
+          thinkingConfig: { thinkingLevel: PROSE_THINKING },
+          httpOptions: { timeout: ctx.timeoutMs },
+          abortSignal: ctx.signal,
+        },
+      });
+
+      // A truncated answer is worse than no answer: it looks complete and is
+      // not. Detect it and let the caller render the figures deterministically.
+      const finish = response.candidates?.[0]?.finishReason;
+      if (finish === "MAX_TOKENS") throw new OutputTruncatedError(model);
+
+      const text = response.text;
+      if (!text) throw new Error("Empty response from model.");
+      return text;
+    },
+    { perCallCapMs: PROSE_CALL_TIMEOUT_MS },
+    label
+  ));
+
+  return { text: value, meta };
+}
+
+/* -------------------------------------------------------------------------- */
+/* JSON parsing                                                               */
+/* -------------------------------------------------------------------------- */
+
+export type QueryIntent =
+  | "DATA_QUERY"
+  | "RECALL_PREVIOUS_SQL"
+  | "NEEDS_CLARIFICATION"
+  | "NOT_DATA_RELATED";
+
+export type AnswerShape = "SCALAR" | "SINGLE_ROW" | "ROW_SET" | "NONE";
+
+export interface QueryPlan {
+  intent: QueryIntent;
+  plan: string;
+  assumptions: string[];
+  sql: string;
+  answerShape: AnswerShape;
+  clarifyingQuestion: string;
+  selfCheck: string;
+}
+
+function stripFences(text: string): string {
+  let t = text.trim();
+  if (t.startsWith("```")) {
+    t = t.replace(/^```[a-zA-Z]*\s*/, "").replace(/```\s*$/, "").trim();
+  }
+  return t;
+}
+
+export function extractJsonObject(text: string): any | null {
+  const t = stripFences(text);
+  try {
+    return JSON.parse(t);
+  } catch {
+    /* fall through */
+  }
+
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+
+  const candidate = t.slice(start, end + 1);
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    try {
+      return JSON.parse(candidate.replace(/,\s*([}\]])/g, "$1"));
+    } catch {
+      return null;
+    }
+  }
+}
+
+function cleanSql(sql: string): string {
+  let s = stripFences(String(sql || "")).trim();
+  if (s.toLowerCase().startsWith("sql\n")) s = s.slice(4);
+  return s.replace(/;\s*$/, "").trim();
+}
+
+export function normalisePlan(parsed: any, rawText: string): QueryPlan {
+  if (!parsed) {
+    const bare = stripFences(rawText).trim();
+    if (/^(select|with)\b/i.test(bare)) {
+      return {
+        intent: "DATA_QUERY",
+        plan: "(model returned bare SQL instead of the JSON contract)",
+        assumptions: [],
+        sql: cleanSql(bare),
+        answerShape: "ROW_SET",
+        clarifyingQuestion: "",
+        selfCheck: "",
+      };
+    }
+    // Never throw an unfalsifiable error again. Show the evidence.
+    const preview = String(rawText || "").slice(0, 1200);
+    const looksTruncated =
+      preview.trimEnd().length > 0 &&
+      !preview.trimEnd().endsWith("}") &&
+      preview.includes("{");
+    console.error(
+      `[davis] planner returned unparseable output (${
+        String(rawText || "").length
+      } chars${looksTruncated ? ", appears CUT OFF mid-JSON" : ""}). ` +
+        `First 1200 chars:\n${preview}`
+    );
+    throw new Error(
+      "The query planner returned a response DAVIS could not parse as JSON" +
+        (looksTruncated
+          ? " — it appears to have been cut off mid-object, which usually means " +
+            "the output token budget ran out. Raise DAVIS_SQL_MAX_OUTPUT_TOKENS " +
+            "or lower DAVIS_SQL_THINKING_LEVEL."
+          : ". The full response is in the server log.")
+    );
+  }
+
+  const validIntents: QueryIntent[] = [
+    "DATA_QUERY",
+    "RECALL_PREVIOUS_SQL",
+    "NEEDS_CLARIFICATION",
+    "NOT_DATA_RELATED",
+  ];
+  const intent = String(parsed.intent || "DATA_QUERY").toUpperCase() as QueryIntent;
+
+  return {
+    intent: validIntents.includes(intent) ? intent : "DATA_QUERY",
+    plan: String(parsed.plan || ""),
+    assumptions: Array.isArray(parsed.assumptions)
+      ? parsed.assumptions.map((a: any) => String(a)).filter(Boolean)
+      : [],
+    sql: cleanSql(parsed.sql || ""),
+    answerShape: (["SCALAR", "SINGLE_ROW", "ROW_SET", "NONE"].includes(
+      String(parsed.answer_shape || "").toUpperCase()
+    )
+      ? String(parsed.answer_shape).toUpperCase()
+      : "ROW_SET") as AnswerShape,
+    clarifyingQuestion: String(parsed.clarifying_question || ""),
+    selfCheck: String(parsed.self_check || ""),
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Public API                                                                 */
+/* -------------------------------------------------------------------------- */
+
+export interface PlanQueryParams {
+  question: string;
+  schemaDoc: string;
+  dialect: string;
+  chatHistory?: string;
+  todayISO?: string;
+}
+
+export async function planQuery(
+  params: PlanQueryParams
+): Promise<{ plan: QueryPlan; meta: CallMeta }> {
+  const prompt = buildSqlPrompt({
+    question: params.question,
+    schemaDoc: params.schemaDoc,
+    dialect: params.dialect,
+    chatHistory: params.chatHistory,
+    todayISO: params.todayISO || new Date().toISOString().slice(0, 10),
+  });
+
+  const { text, meta } = await generateJson(SQL_MODEL_CHAIN, prompt, "plan query");
+  return { plan: normalisePlan(extractJsonObject(text), text), meta };
+}
+
+export interface RepairQueryParams {
+  question: string;
+  schemaDoc: string;
+  dialect: string;
+  failedSql: string;
+  errorMessage: string;
+  previousPlan?: string;
+  attempt: number;
+}
+
+export async function repairQuery(
+  params: RepairQueryParams
+): Promise<{ plan: QueryPlan; meta: CallMeta }> {
+  const prompt = buildRepairPrompt(params);
+  const { text, meta } = await generateJson(
+    SQL_MODEL_CHAIN,
+    prompt,
+    `repair query (attempt ${params.attempt})`
+  );
+  return { plan: normalisePlan(extractJsonObject(text), text), meta };
 }
 
 export interface GenerateAnswerParams {
   question: string;
   sql: string;
-  data: any[];
+  factSheet: string;
+  dataPreview: string;
+  rowCount: number;
+  totalRowCount?: number | null;
+  truncated: boolean;
+  answerShape: string;
+  assumptions: string[];
   chatHistory?: string;
 }
 
-export async function generateConversationalAnswer({ question, sql, data, chatHistory }: GenerateAnswerParams): Promise<string> {
-  const prompt = `
-You are an expert Data Analyst and helpful AI Assistant named DAVIS. Only mention your name when asked.
-Your task is to answer the user's question directly and conversationally using the provided data.
+export async function generateConversationalAnswer(
+  params: GenerateAnswerParams
+): Promise<{ answer: string; meta: CallMeta }> {
+  const prompt = buildAnswerPrompt(params);
+  const { text, meta } = await generateText(
+    PROSE_MODEL_CHAIN,
+    prompt,
+    "render answer"
+  );
+  return { answer: text.trim(), meta };
+}
 
---- INSTRUCTIONS ---
-1. Review the User Question, the Chat History, the SQL Query Used, and the Data Results below.
-2. Synthesize the data into a clear, concise, and personable answer.
-3. Do not mention the SQL query or database schema unless the user specifically asks how you calculated the answer, what the query was, or how you arrived at the result.
-4. Just deliver the insights directly to the user as if you are their personal assistant.
-5. If the data is empty or indicates no results, say so politely.
-6. CRITICAL: Be strictly factual and precise. Do not hallucinate or invent facts.
-7. CRITICAL: Answer ONLY using the provided Data Results. If the data does not contain the answer, explicitly state that you cannot answer based on the current data.
-8. CRITICAL: You are only provided with a maximum of 50 rows of data. If the user asks for a total, sum, or average, and the Data Results contain raw unaggregated rows, DO NOT attempt to calculate the math yourself. Explicitly state that you cannot calculate the total because you only have a sample of the data.
-
---- CHAT HISTORY (For context only) ---
-${chatHistory || "No previous history."}
-
---- USER QUESTION ---
-${question}
-
---- SQL QUERY USED ---
-${sql}
-
---- DATA RESULTS ---
-${JSON.stringify(data.slice(0, 50), null, 2)}
-
---- YOUR ANSWER ---
-`;
-
-  try {
-    const result = await withRetry(() => model.generateContent(prompt));
-    const response = await result.response;
-    return response.text().trim();
-  } catch (error: any) {
-    console.error("Gemini Answer Generation Error:", error.message || error);
-    throw new Error("Failed to generate conversational answer.");
-  }
+export async function generateNonDataReply(params: {
+  question: string;
+  chatHistory?: string;
+  connectionName: string;
+}): Promise<{ answer: string; meta: CallMeta }> {
+  const prompt = buildNonDataPrompt(params);
+  const { text, meta } = await generateText(
+    PROSE_MODEL_CHAIN,
+    prompt,
+    "non-data reply"
+  );
+  return { answer: text.trim(), meta };
 }

@@ -1,217 +1,255 @@
-import { prisma } from "@/lib/prisma";
-import { decryptText } from "@/lib/encryption";
-import { Client as PgClient } from "pg";
-import mysql from "mysql2/promise";
+import {
+  DbHandle,
+  Dialect,
+  dialectLabel,
+  getDbCredentials,
+  openConnection,
+  withConnection,
+} from "@/lib/db/connection";
+
+export {
+  buildSchemaContext,
+  getSchemaContext,
+  renderSchemaForPrompt,
+  introspectSchema,
+} from "@/lib/db/schemaContext";
+export type { SchemaContext } from "@/lib/db/schemaContext";
+export { dialectLabel };
+
+export const MAX_ROWS = Number(process.env.DAVIS_MAX_ROWS || 1000);
 
 export interface QueryResult {
   columns: string[];
   rows: any[];
+  /** Rows actually returned (after the safety cap). */
+  rowCount: number;
+  /** True when the result hit MAX_ROWS and more rows exist. */
+  truncated: boolean;
+  /** The SQL that was really executed, after the LIMIT guard. */
+  executedSql?: string;
   error?: string;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Read-only enforcement                                                      */
+/* -------------------------------------------------------------------------- */
+
 /**
- * Fetches the database connection and decrypts the password.
+ * Strip comments and string literals so keyword scanning cannot be fooled by
+ * a legitimate value like  WHERE CHIEF_COMPLAINT_TXT LIKE '%update%'.
  */
-async function getDbCredentials(connectionId: string, orgId: string) {
-  const conn = await prisma.databaseConnection.findFirst({
-    where: { id: connectionId, organizationId: orgId },
-  });
+function stripLiteralsAndComments(sql: string): string {
+  return sql
+    .replace(/--[^\n]*/g, " ")
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/'(?:[^']|'')*'/g, " '' ")
+    .replace(/"(?:[^"]|"")*"/g, ' "" ');
+}
 
-  if (!conn) {
-    throw new Error("Database connection not found or access denied.");
-  }
+const FORBIDDEN = [
+  "insert",
+  "update",
+  "delete",
+  "drop",
+  "alter",
+  "create",
+  "truncate",
+  "replace",
+  "merge",
+  "grant",
+  "revoke",
+  "attach",
+  "detach",
+  "vacuum",
+  "reindex",
+  "pragma",
+  "call",
+  "execute",
+  "exec",
+  "copy",
+  "into",
+  "lock",
+  "commit",
+  "rollback",
+  "savepoint",
+];
 
-  const password = decryptText(conn.encryptedPassword);
-  return { ...conn, password };
+export interface GuardResult {
+  ok: boolean;
+  error?: string;
+  sql: string;
 }
 
 /**
- * Introspects the schema (tables and columns) of the database to feed to the LLM.
+ * Verifies a statement is a single read-only query and appends a hard row cap.
+ * The previous implementation only checked that the string started with SELECT,
+ * which let stacked statements and CTE-wrapped writes through.
  */
-export async function introspectSchema(connectionId: string, orgId: string): Promise<string> {
-  const credentials = await getDbCredentials(connectionId, orgId);
+export function guardQuery(rawSql: string, dialect: Dialect): GuardResult {
+  let sql = (rawSql || "").trim();
+
+  // Strip a trailing semicolon (and any trailing whitespace/comments).
+  sql = sql.replace(/;\s*$/, "").trim();
+
+  if (!sql) {
+    return { ok: false, error: "Empty query.", sql };
+  }
+
+  const scrubbed = stripLiteralsAndComments(sql);
+
+  // Reject stacked statements.
+  if (/;/.test(scrubbed)) {
+    return {
+      ok: false,
+      error: "Only a single SQL statement is permitted.",
+      sql,
+    };
+  }
+
+  const head = scrubbed.trim().toUpperCase();
+  if (!head.startsWith("SELECT") && !head.startsWith("WITH")) {
+    return {
+      ok: false,
+      error: "Only SELECT (or WITH ... SELECT) queries are permitted.",
+      sql,
+    };
+  }
+
+  for (const kw of FORBIDDEN) {
+    const re = new RegExp(`\\b${kw}\\b`, "i");
+    if (re.test(scrubbed)) {
+      return {
+        ok: false,
+        error: `Query rejected: the keyword "${kw.toUpperCase()}" is not permitted in a read-only query.`,
+        sql,
+      };
+    }
+  }
+
+  // Append a row cap when the model did not supply one, so a runaway query
+  // cannot pull a million rows into memory. We ask for MAX_ROWS + 1 so we can
+  // detect truncation.
+  const hasLimit = /\blimit\b|\bfetch\s+first\b/i.test(scrubbed);
+  const executedSql = hasLimit ? sql : `${sql}\nLIMIT ${MAX_ROWS + 1}`;
+
+  return { ok: true, sql: executedSql };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Dry-run validation                                                         */
+/* -------------------------------------------------------------------------- */
+
+function explainPrefix(dialect: Dialect): string {
+  if (dialect === "SQLITE") return "EXPLAIN QUERY PLAN ";
+  return "EXPLAIN ";
+}
+
+/**
+ * Ask the engine to plan the query without running it. This catches
+ * hallucinated tables/columns and syntax errors in milliseconds, so the
+ * self-correction loop can fix them before we pay for a real execution.
+ */
+export async function validateQuery(
+  connectionId: string,
+  orgId: string,
+  sql: string
+): Promise<{ valid: boolean; error?: string }> {
+  try {
+    return await withConnection(connectionId, orgId, async (handle) => {
+      const dialect = handle.dialect;
+      const guard = guardQuery(sql, dialect);
+      if (!guard.ok) return { valid: false, error: guard.error };
+
+      try {
+        await handle.run(explainPrefix(dialect) + guard.sql);
+        return { valid: true };
+      } catch (err: any) {
+        return { valid: false, error: err?.message || String(err) };
+      }
+    });
+  } catch (err: any) {
+    return { valid: false, error: err?.message || String(err) };
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Execution                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/** Execute a read-only query with validation, row cap and timeout. */
+export async function executeQuery(
+  connectionId: string,
+  orgId: string,
+  query: string
+): Promise<QueryResult> {
+  const empty = { columns: [], rows: [], rowCount: 0, truncated: false };
+
+  let credentials;
+  try {
+    credentials = await getDbCredentials(connectionId, orgId);
+  } catch (err: any) {
+    return { ...empty, error: err?.message || String(err) };
+  }
+
+  const dialect = credentials.type.toUpperCase() as Dialect;
+  const guard = guardQuery(query, dialect);
+  if (!guard.ok) {
+    return { ...empty, error: `Security Error: ${guard.error}` };
+  }
+
+  let handle: DbHandle;
+  try {
+    handle = await openConnection(credentials);
+  } catch (err: any) {
+    return { ...empty, error: `Connection failed: ${err?.message || err}` };
+  }
 
   try {
-    if (credentials.type === "POSTGRESQL") {
-      const client = new PgClient({
-        host: credentials.host,
-        port: credentials.port,
-        database: credentials.database,
-        user: credentials.username,
-        password: credentials.password,
-        ssl: credentials.ssl ? { rejectUnauthorized: false } : false,
-      });
+    const res = await handle.run(guard.sql);
+    const truncated = res.rows.length > MAX_ROWS;
+    const rows = truncated ? res.rows.slice(0, MAX_ROWS) : res.rows;
 
-      await client.connect();
-      // Simple introspection query for Postgres
-      const res = await client.query(`
-        SELECT table_name, column_name, data_type 
-        FROM information_schema.columns 
-        WHERE table_schema = 'public'
-        ORDER BY table_name, ordinal_position;
-      `);
-      await client.end();
-
-      return formatSchema(res.rows, "table_name", "column_name", "data_type");
-    } else if (credentials.type === "MYSQL" || credentials.type === "MARIADB") {
-      const connection = await mysql.createConnection({
-        host: credentials.host,
-        port: credentials.port,
-        database: credentials.database,
-        user: credentials.username,
-        password: credentials.password,
-        ssl: credentials.ssl ? { rejectUnauthorized: false } : undefined,
-      });
-
-      const [rows] = await connection.execute(`
-        SELECT TABLE_NAME as table_name, COLUMN_NAME as column_name, DATA_TYPE as data_type
-        FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA = ?
-        ORDER BY TABLE_NAME, ORDINAL_POSITION;
-      `, [credentials.database]);
-
-      await connection.end();
-      return formatSchema(rows as any[], "table_name", "column_name", "data_type");
-    } else if (credentials.type === "SQLITE") {
-      const sqlite3 = require('sqlite3').verbose();
-      const dbPath = credentials.database === "dev.db" ? "./dev.db" : credentials.database;
-
-      const schemaRows = await new Promise<any[]>((resolve, reject) => {
-        const db = new sqlite3.Database(dbPath, (err: Error) => {
-          if (err) return reject(err);
-          // SQLite introspection: list all tables and their PRAGMA table_info
-          db.all("SELECT name as table_name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", async (err: Error, tables: any[]) => {
-            if (err) return reject(err);
-
-            let allColumns: any[] = [];
-            let processed = 0;
-
-            if (tables.length === 0) return resolve([]);
-
-            tables.forEach(table => {
-              db.all(`PRAGMA table_info('${table.table_name}')`, (err: Error, cols: any[]) => {
-                if (err) return reject(err);
-
-                cols.forEach(col => {
-                  allColumns.push({
-                    table_name: table.table_name,
-                    column_name: col.name,
-                    data_type: col.type
-                  });
-                });
-
-                processed++;
-                if (processed === tables.length) {
-                  db.close();
-                  resolve(allColumns);
-                }
-              });
-            });
-          });
-        });
-      });
-
-      return formatSchema(schemaRows, "table_name", "column_name", "data_type");
-    }
-
-    return "Schema introspection for this database type is not yet fully supported in this demo.";
-  } catch (error: any) {
-    console.error("Schema Introspection Error:", error);
-    throw new Error(`Failed to introspect schema: ${error.message}`);
+    return {
+      columns: res.columns.length
+        ? res.columns
+        : rows.length
+        ? Object.keys(rows[0])
+        : [],
+      rows,
+      rowCount: rows.length,
+      truncated,
+      executedSql: guard.sql,
+    };
+  } catch (err: any) {
+    return {
+      ...empty,
+      executedSql: guard.sql,
+      error: err?.message || String(err),
+    };
+  } finally {
+    await handle.close();
   }
 }
 
 /**
- * Executes a raw SQL query. Only allows SELECT statements.
+ * Runs a COUNT(*) over the model's query so we can report the true total even
+ * when the row cap kicked in. Used only when the result was truncated.
  */
-export async function executeQuery(connectionId: string, orgId: string, query: string): Promise<QueryResult> {
-  // Security Check: Basic verification that this is a read-only query
-  const cleanQuery = query.trim().toUpperCase();
-  if (!cleanQuery.startsWith("SELECT") && !cleanQuery.startsWith("WITH")) {
-    return { columns: [], rows: [], error: "Security Error: Only SELECT queries are permitted." };
-  }
-
-  const credentials = await getDbCredentials(connectionId, orgId);
-
+export async function countRows(
+  connectionId: string,
+  orgId: string,
+  sql: string
+): Promise<number | null> {
+  const cleaned = sql.replace(/;\s*$/, "").trim();
   try {
-    if (credentials.type === "POSTGRESQL") {
-      const client = new PgClient({
-        host: credentials.host,
-        port: credentials.port,
-        database: credentials.database,
-        user: credentials.username,
-        password: credentials.password,
-        ssl: credentials.ssl ? { rejectUnauthorized: false } : false,
-      });
-
-      await client.connect();
-      const res = await client.query(query);
-      await client.end();
-
-      return {
-        columns: res.fields.map((f: any) => f.name),
-        rows: res.rows,
-      };
-    } else if (credentials.type === "MYSQL" || credentials.type === "MARIADB") {
-      const connection = await mysql.createConnection({
-        host: credentials.host,
-        port: credentials.port,
-        database: credentials.database,
-        user: credentials.username,
-        password: credentials.password,
-        ssl: credentials.ssl ? { rejectUnauthorized: false } : undefined,
-      });
-
-      const [rows, fields] = await connection.execute(query);
-      await connection.end();
-
-      return {
-        columns: (fields as any[]).map((f) => f.name),
-        rows: rows as any[],
-      };
-    } else if (credentials.type === "SQLITE") {
-      const sqlite3 = require('sqlite3').verbose();
-      const dbPath = credentials.database === "dev.db" ? "./dev.db" : credentials.database;
-
-      const res = await new Promise<{ columns: string[], rows: any[] }>((resolve, reject) => {
-        const db = new sqlite3.Database(dbPath, (err: Error) => {
-          if (err) return reject(err);
-
-          db.all(query, (err: Error, rows: any[]) => {
-            db.close();
-            if (err) return reject(err);
-
-            const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
-            resolve({ columns, rows });
-          });
-        });
-      });
-
-      return res;
-    }
-
-    return { columns: [], rows: [], error: "Database execution for this driver is not implemented in this demo." };
-  } catch (error: any) {
-    return { columns: [], rows: [], error: error.message };
+    return await withConnection(connectionId, orgId, async (handle) => {
+      const res = await handle.run(
+        `SELECT COUNT(*) AS _n FROM (${cleaned}) AS _davis_count`
+      );
+      const n = res.rows[0]?._n ?? res.rows[0]?.["COUNT(*)"];
+      return n === undefined ? null : Number(n);
+    });
+  } catch {
+    return null;
   }
-}
-
-// Helper to format raw SQL results into a readable string for the LLM
-function formatSchema(rows: any[], tableCol: string, colCol: string, typeCol: string): string {
-  const tables: Record<string, string[]> = {};
-
-  for (const row of rows) {
-    const table = row[tableCol];
-    const column = row[colCol];
-    const type = row[typeCol];
-
-    if (!tables[table]) tables[table] = [];
-    tables[table].push(`${column} (${type})`);
-  }
-
-  let result = "";
-  for (const [table, cols] of Object.entries(tables)) {
-    result += `Table: ${table}\nColumns: ${cols.join(", ")}\n\n`;
-  }
-  return result;
 }
