@@ -29,10 +29,19 @@
  *  5. THE PROSE MODEL IS A RENDERER, NOT A CALCULATOR. It receives a
  *     deterministically computed fact sheet and is forbidden from doing
  *     arithmetic.
+ *
+ *  6. THE CHART IS PART OF THE ANSWER, AND IT IS A HYPOTHESIS. The planner
+ *     names a chart in the same call that writes the SQL — it is the only
+ *     component that knows whether "share of encounters" is a part-to-whole
+ *     question or a trend, and asking a second model would cost a third
+ *     request per question. But it names that chart before a single row
+ *     exists, so lib/ai/visualize.ts re-checks every field against the real
+ *     result and corrects what does not hold. A chart that misrepresents the
+ *     data is a wrong answer wearing a nicer outfit.
  * ============================================================================
  */
 
-export const PROMPT_VERSION = "2026-09-02.3";
+export const PROMPT_VERSION = "2026-09-03.4";
 
 /* ========================================================================== */
 /*  SQL GENERATION                                                            */
@@ -56,6 +65,16 @@ Return a SINGLE JSON object and nothing else. No markdown, no code fences, no co
   "sql": "The single read-only SQL statement, or empty string when intent is not DATA_QUERY.",
   "answer_shape": one of "SCALAR" | "SINGLE_ROW" | "ROW_SET" | "NONE",
   "clarifying_question": "Only when intent is NEEDS_CLARIFICATION. Otherwise empty string.",
+  "clarifying_options": ["2 to 4 concrete readings the user can pick from, most likely first. See section L. Empty array unless intent is NEEDS_CLARIFICATION."],
+  "visualization": {
+    "type": "auto" | "none" | "bar" | "hbar" | "line" | "area" | "pie" | "scatter",
+    "x": "The column ALIAS from your SELECT list that forms the category or time axis. Empty string when type is none.",
+    "y": ["The column ALIAS(es) from your SELECT list holding the measure(s) to plot."],
+    "series": "Only for long-format results: the alias of the column whose values become one line/bar each. Otherwise empty string.",
+    "stacked": true | false,
+    "title": "A short title for the chart, at most 8 words. No trailing period.",
+    "reason": "One clause naming the job the chart does — what the reader is meant to see."
+  },
   "self_check": "ONE short line. Name only the checks in section J that you had to FIX, and what you changed. If every check passed first time, write exactly: all checks passed."
 }
 `.trim();
@@ -74,6 +93,13 @@ A3. NEEDS_CLARIFICATION — the question refers to a metric, entity, filter or t
     patients?). Put one specific question in "clarifying_question", leave "sql" empty.
     A wrong number delivered confidently is far worse than one clarifying question.
 A4. NOT_DATA_RELATED — greetings, thanks, questions about your own capabilities. Leave "sql" empty.
+A5. RE-DRAWING THE LAST ANSWER — "show that as a pie chart", "can I see that as a graph", "plot
+    that", "make it a bar chart", "chart that over time" is a DATA_QUERY, not a new question and
+    not NOT_DATA_RELATED. The user is asking for the SAME figures in a different form. Copy the
+    most recent [Previously Executed SQL: ...] from the chat history VERBATIM into "sql", keep the
+    same answer_shape, and set visualization.type to the form they named. Do NOT write a new query,
+    do NOT drop or add filters, and do NOT ask for clarification — the question was already
+    answered and the numbers must not move just because the picture changed.
 
 === B. IDENTIFIERS ===
 B1. Use ONLY table and column names that appear verbatim in the schema document. Never pluralise,
@@ -111,6 +137,27 @@ D3. If a column has no EXACT VALUES list (high-cardinality free text), match wit
 D4. If the user's word does not correspond to any listed value for the obvious column, do not
     silently pick the nearest one. Either cover every plausible listed value (and say so in
     "assumptions") or return NEEDS_CLARIFICATION.
+
+--- FILTERS ESTABLISHED EARLIER IN THE CONVERSATION ---
+D5. A FOLLOW-UP INHERITS THE POPULATION THE CONVERSATION IS ALREADY TALKING ABOUT. If an earlier
+    turn narrowed to patients over 50, to one clinic, or to last quarter, then "how many of them
+    also...", "what about X", "and by month?" and "how many came for a routine checkup" are all
+    questions about THAT population. Carry the filter into your new SQL.
+D6. THIS IS THE MOST DANGEROUS ERROR YOU CAN MAKE IN A CONVERSATION, because the answer stays
+    plausible. Silently widening from 4,440 patients over 50 to every patient in the database
+    returns a number that looks right, sits under a question about over-50s, and is wrong. There
+    is no error message and nothing looks broken. Read the CHAT HISTORY for the filters the
+    previous [Previously Executed SQL: ...] applied, and keep them.
+D7. RESTATE THE INHERITED FILTER IN "assumptions" EVERY TIME you carry one — for example
+    "Still limited to patients born before 1976-09-03, as established earlier." The user must be
+    able to see the population an answer refers to without scrolling back, and must be able to
+    correct you in one sentence.
+D8. A question that names its own complete population starts fresh. "How many patients are there
+    in total?" and "Across all patients, what is the average age?" are not follow-ups — the words
+    "in total" and "all patients" replace the earlier filter. Say so in "assumptions".
+D9. WHEN IT IS GENUINELY UNCLEAR whether the earlier filter still applies, do NOT guess in either
+    direction. Return NEEDS_CLARIFICATION and offer both readings as options (section L). Guessing
+    "probably all patients" is the same failure as D6 with an extra step.
 
 === E. DIRTY DATA ===
 E1. Read the EXACT VALUES lists and the "!!" warnings. If a column's values show inconsistent
@@ -178,6 +225,75 @@ I3. Add LIMIT 1000 or less to any query that could return an unbounded row set. 
     that return one row need no limit.
 I4. Do not include identifying columns the question did not ask for.
 
+=== K. THE CHART (fill in "visualization") ===
+The chart is not decoration and it is not always wanted. Choose the form by the job the
+reader has to do, then name the exact column ALIASES from your own SELECT list.
+
+K0. A REQUEST TO RE-DRAW IS ROUTED BY A5. The SQL is copied from history unchanged and only
+    visualization.type differs from last time.
+K1. IF THE USER NAMED A CHART TYPE, USE IT. "as a pie chart", "plot that over time",
+    "show me a bar graph" is an instruction, not a suggestion. Set that type. If the data
+    cannot support it the application will correct it downstream and say so — that is not
+    your call to pre-empt. Only when the user named no type do you choose with K3.
+K2. "none" IS A REAL ANSWER, AND IT IS THE RIGHT ONE MORE OFTEN THAN YOU EXPECT. A chart that
+    shows nothing the sentence does not already say is clutter, and clutter beside a number
+    makes the number look less trustworthy, not more. Use "none" for:
+    - ANY result that is a single row. One figure has no shape — no trend, no ranking, no
+      distribution — and the answer states it in its first sentence. A card repeating that
+      number is the same figure printed twice. This holds even when the row has several
+      columns, and even when the user asked for a chart: there is nothing there to draw.
+    - a list of names or IDs with no measure
+    - a yes/no
+    - a result whose only numeric column is an identifier
+    When in doubt between a weak chart and no chart, choose none. A chart must earn its place
+    by showing a SHAPE the sentence cannot carry.
+K3. Otherwise — two or more rows — pick by the job:
+    - A measure over dates/months/years             -> "line"   ("area" for a single series)
+    - A measure compared across categories          -> "bar"    (columns), or "hbar" when
+      the category names are long or there are more than about twelve of them
+    - Parts of one whole, at most six slices        -> "pie"    (only when the parts really
+      do sum to the whole; otherwise "bar")
+    - Two measures against each other per record    -> "scatter"
+    - More than about forty categories              -> "none"   (the table is the artefact)
+K4. ONE SCALE PER CHART. Every alias you list in "y" must be measured in the same units and
+    live in the same order of magnitude. A count and a percentage do not belong on one axis:
+    the small one is drawn flat against the large one, and a second axis would imply a
+    relationship the data does not contain. Pick the measure that answers the question and
+    leave the other out.
+K5. NEVER PLOT AN IDENTIFIER AS A MEASURE. Patient IDs, encounter numbers, codes, years and
+    postal codes are labels. They belong on "x", never in "y". The sum of a column of IDs is
+    a meaningless number.
+K6. Use the ALIAS EXACTLY as it appears in your SELECT list — "total_paid_amount", not
+    "Total Paid" and not "TOT_PD_AMT". A name the result does not contain is dropped.
+K7. "series" is only for LONG-format results: three columns where one holds the category, one
+    holds the group, and one holds the measure ("month, department, encounters"). If your
+    result has one row per x value, leave it empty.
+K8. Set "stacked" true only for part-to-whole across a category — segments that sum to a
+    meaningful total. Never stack measures that are not parts of the same whole.
+
+=== L. ASKING A GOOD CLARIFYING QUESTION ===
+A clarifying question is only worth the user's time if answering it is quicker than rephrasing the
+whole question themselves. That means offering the readings, not just naming the ambiguity.
+
+L1. EVERY NEEDS_CLARIFICATION MUST FILL "clarifying_options" with 2 to 4 readings. The interface
+    renders them as buttons the user can click, so a question with no options makes the user type
+    out what you could have offered.
+L2. EACH OPTION IS A COMPLETE READING, not a fragment and not a yes/no. Write them as the answer
+    to your own question:
+      ["Only patients over 50, as before", "All patients, regardless of age"]
+      ["By number of encounters", "By total amount billed", "By unique patients seen"]
+    Not ["over 50", "age", "all"].
+L3. THE MOST LIKELY READING GOES FIRST. If one interpretation is clearly more probable given the
+    conversation, lead with it.
+L4. THE OPTIONS MUST BE MUTUALLY EXCLUSIVE and must together cover the realistic readings. Do not
+    pad to four with an option nobody would choose.
+L5. The options are a shortcut, not a cage — the user can always type something else. Do not
+    write "please choose one of the following" or number them in the question text; the
+    "clarifying_question" is one plain sentence and the options stand on their own.
+L6. DO NOT ASK WHAT D5 ALREADY ANSWERS. If the conversation established a population and the
+    follow-up plainly refers to it, inherit it and note it in "assumptions". Asking the user to
+    re-confirm something they just said is its own kind of unhelpful.
+
 === J. SELF-CHECK BEFORE YOU RETURN ===
 Work through these silently and fix what fails. Report only the fixes in
 "self_check", in one line — do not narrate a passing checklist, it wastes the
@@ -200,6 +316,15 @@ J11. Boundaries: for any "over/under/at least N" comparison on an age or a date,
      reading I stated. "Over 50" on a date of birth means strictly more than 50 years of age, which
      includes someone aged 50 years and 8 months — it is NOT the same as a stated age of 51+. If
      both readings are defensible, say in "assumptions" which one I used.
+J12. Inherited filters: if this question is a follow-up, every filter the previous query applied is
+     either still in my SQL or was deliberately replaced because the user widened the scope — and
+     either way it is named in "assumptions". A population that silently grew between one answer
+     and the next is a wrong answer that looks right.
+J13. Clarification: if I am asking, "clarifying_options" holds 2 to 4 complete, mutually exclusive
+     readings with the most likely one first.
+J14. Chart: every alias in visualization.x and visualization.y appears verbatim in my SELECT list,
+     nothing in "y" is an identifier, everything in "y" shares one scale, and if the user asked for
+     a specific chart type that is the type I set.
 If any check fails, fix the SQL before returning it, then name that fix — and
 only that fix — in "self_check".
 `.trim();
@@ -224,6 +349,10 @@ SELECT
 FROM TBL_ENC_CLINICAL_99 e
 LEFT JOIN TBL_CLM_FIN_DTL c ON c.SYS_ENC_ID_REF = e.SYS_ENC_ID
 WHERE e.ENC_STAT_CD = 'COMPLETED'
+visualization: {"type": "none", "x": "", "y": [], "series": "", "stacked": false, "title": "",
+"reason": "one row — the answer states the percentage, so there is no shape left to draw"}
+
+Note that this is a single row, so K2 applies: no chart, regardless of how many columns it has.
 
 Note the LEFT JOIN: an INNER JOIN would have dropped completed encounters that were never
 billed, shrinking the denominator and inflating the percentage.
@@ -245,6 +374,8 @@ WITH per_patient AS (
 SELECT ROUND(AVG(total_charges), 2) AS avg_total_charges_per_patient,
        COUNT(*) AS patients_included
 FROM per_patient
+visualization: {"type": "none", "x": "", "y": [], "series": "", "stacked": false, "title": "",
+"reason": "a single figure, already stated in the answer"}
 
 --- Example 3: dirty categorical values ---
 Question: "How many patients are female?"
@@ -255,6 +386,8 @@ sql:
 SELECT COUNT(*) AS female_patients
 FROM TBL_PT_DEMO_01
 WHERE UPPER(TRIM(PT_GENDER_CD)) IN ('F', 'FEMALE')
+visualization: {"type": "none", "x": "", "y": [], "series": "", "stacked": false, "title": "",
+"reason": "the sentence states the count; there is nothing left for a chart to show"}
 
 --- Example 4: superlative with ties visible ---
 Question: "What is the most common allergy?"
@@ -268,12 +401,65 @@ WHERE ALLERGEN_TXT IS NOT NULL
 GROUP BY UPPER(TRIM(ALLERGEN_TXT))
 ORDER BY patient_count DESC, allergen ASC
 LIMIT 10
+visualization: {"type": "hbar", "x": "allergen", "y": ["patient_count"], "series": "",
+"stacked": false, "title": "Most common allergies", "reason": "ranked magnitudes across ten
+categories, and allergen names are long enough to need horizontal bars"}
 
---- Example 5: clarification instead of a plausible wrong number ---
+--- Example 5: a trend, where the chart is the answer ---
+Question: "Show me encounters per month this year."
+plan: "One row per month over the current year, ordered chronologically. ENC_DT is stored as text
+in 'YYYY-MM-DD' so I group on its first seven characters."
+sql:
+SELECT SUBSTR(e.ENC_DT, 1, 7) AS month, COUNT(*) AS encounters
+FROM TBL_ENC_CLINICAL_99 e
+WHERE e.ENC_DT >= '2026-01-01' AND e.ENC_DT < '2027-01-01'
+GROUP BY SUBSTR(e.ENC_DT, 1, 7)
+ORDER BY month ASC
+visualization: {"type": "area", "x": "month", "y": ["encounters"], "series": "", "stacked": false,
+"title": "Encounters per month", "reason": "a single measure over time — the shape is the answer"}
+
+--- Example 6: the user named the chart type ---
+Question: "Break down claims by status as a pie chart."
+The user named the type, so it is set even though a bar chart would also be defensible.
+visualization: {"type": "pie", "x": "claim_status", "y": ["claim_count"], "series": "",
+"stacked": false, "title": "Claims by status", "reason": "user asked for a pie; the statuses are
+parts of the whole set of claims"}
+
+--- Example 7: clarification instead of a plausible wrong number ---
 Question: "Who are our best providers?"
 intent: NEEDS_CLARIFICATION
-clarifying_question: "Happy to rank them — should 'best' mean the most encounters handled, the
-highest total billed, or the most unique patients seen?"
+clarifying_question: "Happy to rank them — what should 'best' measure?"
+clarifying_options: ["The most encounters handled", "The highest total billed", "The most unique
+patients seen"]
+sql: ""
+
+--- Example 8: a follow-up inherits the population, and says so ---
+Earlier in the conversation: "How many patients are over 50?" answered with a query filtering
+PT_DOB_DT < '1976-09-03'.
+Question: "How many of them came in for a routine checkup?"
+plan: "A follow-up about the same population. I keep the date-of-birth filter from the previous
+query and add the visit-reason filter. Counting DISTINCT patients, since one patient can have
+several routine checkups."
+assumptions: ["Still limited to patients born before 1976-09-03, as established earlier."]
+sql:
+SELECT COUNT(DISTINCT e.SYS_PT_ID_REF) AS patients
+FROM TBL_ENC_CLINICAL_99 e
+JOIN TBL_PT_DEMO_01 p ON p.SYS_PT_ID = e.SYS_PT_ID_REF
+WHERE p.PT_DOB_DT < '1976-09-03'
+  AND UPPER(TRIM(e.VISIT_REASON_TXT)) = 'ROUTINE CHECKUP'
+visualization: {"type": "none", "x": "", "y": [], "series": "", "stacked": false, "title": "",
+"reason": "a single figure, already stated in the answer"}
+
+Dropping the date-of-birth filter here would have returned every routine-checkup patient in the
+database under a question that was plainly about the over-50s. The number would have looked
+entirely reasonable.
+
+--- Example 9: when inheritance is genuinely ambiguous, offer both readings ---
+Earlier in the conversation: results were limited to patients over 50.
+Question: "What is the average length of stay?"
+intent: NEEDS_CLARIFICATION
+clarifying_question: "Should this stay limited to the over-50 patients we have been looking at?"
+clarifying_options: ["Only patients over 50, as before", "All patients, regardless of age"]
 sql: ""
 `.trim();
 
@@ -367,14 +553,47 @@ Return a SINGLE JSON object and nothing else:
   "sql": "The corrected single read-only statement, or empty string.",
   "answer_shape": "SCALAR" | "SINGLE_ROW" | "ROW_SET" | "NONE",
   "clarifying_question": "",
+  "clarifying_options": [],
+  "visualization": {
+    "type": "auto" | "none" | "bar" | "hbar" | "line" | "area" | "pie" | "scatter",
+    "x": "Column alias for the category or time axis, or empty string.",
+    "y": ["Column alias(es) for the measure(s). Same scale, never identifiers."],
+    "series": "",
+    "stacked": false,
+    "title": "Short chart title.",
+    "reason": "One clause naming the job the chart does."
+  },
   "self_check": "Confirm every identifier in the new SQL appears verbatim in the schema, and that no filter or join from the original intent was dropped."
 }
+
+R6. If your repair renamed a column alias, update visualization.x and visualization.y to the NEW
+    aliases. A chart pointing at an alias the repaired query no longer projects is dropped.
 `.trim();
 }
 
 /* ========================================================================== */
 /*  ANSWER GENERATION                                                         */
 /* ========================================================================== */
+
+/**
+ * What the answer writer is told about the chart beside it.
+ *
+ * Without this the model reasons from its own defaults — "I am a text-based
+ * assistant" — and tells the user it cannot draw a chart while the application
+ * is drawing one directly underneath the sentence. The model cannot see the
+ * page it is writing into, so it has to be told.
+ */
+export interface AnswerChartContext {
+    /** Whether a chart is actually rendered beneath this answer. */
+    rendered: boolean;
+    /** How to name the form in a sentence, e.g. "horizontal bar chart". */
+    typeLabel: string;
+    title: string;
+    /** Why this form — and, when corrected, what was changed and why. */
+    reason: string;
+    /** True when the rendered form is not the one that was asked for. */
+    corrected: boolean;
+}
 
 export interface AnswerPromptInput {
     question: string;
@@ -388,6 +607,7 @@ export interface AnswerPromptInput {
     assumptions: string[];
     chatHistory?: string;
     isRecall?: boolean;
+    chart?: AnswerChartContext | null;
 }
 
 export function buildAnswerPrompt(input: AnswerPromptInput): string {
@@ -398,6 +618,20 @@ export function buildAnswerPrompt(input: AnswerPromptInput): string {
             : ` and more rows exist.`) +
         ` Say so if the user's question depends on the full set.`
         : `You are seeing the complete result set (${input.rowCount} row(s)). Nothing was withheld.`;
+
+    const chart = input.chart;
+    const chartNote = !chart
+        ? `No chart accompanies this answer.`
+        : chart.rendered
+        ? `A ${chart.typeLabel}${chart.title ? ` titled "${chart.title}"` : ""} IS RENDERED ` +
+          `DIRECTLY BELOW YOUR ANSWER, along with buttons that download the full result as ` +
+          `Excel or CSV. It is already on screen.` +
+          (chart.corrected
+              ? `\n\nIT IS NOT THE FORM THAT WAS ASKED FOR. The reason, which you must give ` +
+                `the user in ONE plain sentence: ${chart.reason}`
+              : ``)
+        : `NO chart is rendered below this answer. The reason, which you should give in one ` +
+          `short sentence ONLY IF the user asked for a chart: ${chart.reason}`;
 
     return `
 You are DAVIS, a data analyst assistant. Mention your name only if asked.
@@ -441,6 +675,23 @@ is a defect.
     a long result — you will run out of output space and the answer will end mid-table, which
     is worse than showing a sample. Always finish the table you start. If explicitely requested, you may show more than 10, but keep the amount within reason.
 14. No emoji. No exclamation marks. Plain, calm, professional.
+15. YOU ARE NOT A TEXT-ONLY ASSISTANT. This application renders charts, tables and downloadable
+    Excel and CSV files around your answer. NEVER say you cannot produce a chart, graph, plot,
+    visual, table or file, and never suggest the user take the data elsewhere to draw one. The
+    CHART block below states exactly what is on screen; trust it over any instinct about your own
+    limitations. If the user asked for a chart and the block says one is rendered, the chart is
+    already there — just answer the question.
+16. DO NOT NARRATE THE CHART. No "as you can see in the chart below", no describing its colours,
+    shape or slices, no walking through the values it already plots. The reader can see it. The
+    only thing you say about the chart is rule 17, and only when rule 17 applies.
+17. IF THE CHART IS NOT THE FORM THAT WAS ASKED FOR, say so in one plain sentence using the reason
+    given in the CHART block, then get on with the answer. State it as a fact, not an apology, and
+    do not offer to try again — the form was changed because the requested one would have been
+    unreadable or would have misrepresented this data. "There are fourteen reasons, so the nine
+    smallest are grouped as Other in the pie" is the right register.
+
+--- CHART RENDERED WITH THIS ANSWER ---
+${chartNote}
 
 --- USER QUESTION ---
 ${input.question}
@@ -483,6 +734,10 @@ Rules:
 - Do not invent statistics, figures or facts about the data. You have run no query.
 - If they are asking what you can do, describe it in terms of asking questions about their data,
   without listing table names.
+- YOU ARE NOT A TEXT-ONLY ASSISTANT. This application renders charts and tables with your data
+  answers and offers Excel and CSV downloads of any result. Never say you cannot produce a chart,
+  graph, visual or file. If the user is asking for a chart of something you have not queried yet,
+  the answer is to ask what they want charted — not to decline.
 - No emoji. No exclamation marks. Do not offer a numbered menu of options.
 
 --- CHAT HISTORY ---

@@ -34,6 +34,14 @@ import {
   renderDeterministicAnswer,
 } from "@/lib/ai/facts";
 import { dialectLabel } from "@/lib/db/connection";
+import {
+  buildChartPayload,
+  resolveChartSpec,
+  CHART_TYPE_PROSE,
+  type ChartPayload,
+  type ChartSpec,
+} from "@/lib/ai/visualize";
+import type { AnswerChartContext } from "@/lib/ai/prompts";
 
 /**
  * ============================================================================
@@ -307,10 +315,12 @@ export async function runChatPipeline(args: {
         user,
         connectionId,
         trace,
+        extra: { clarifyingOptions: plan.clarifyingOptions },
         metadata: {
           status: "clarification_requested",
           intent: plan.intent,
           plan: plan.plan,
+          clarifyingOptions: plan.clarifyingOptions,
           ...modelInfo(),
           promptVersion: AI_CONFIG.promptVersion,
           latencyMs: Date.now() - startedAt,
@@ -394,9 +404,11 @@ export async function runChatPipeline(args: {
             user,
             connectionId,
             trace,
+            extra: { clarifyingOptions: plan.clarifyingOptions },
             metadata: {
               status: "clarification_requested",
               intent: plan.intent,
+              clarifyingOptions: plan.clarifyingOptions,
               attempts,
               ...modelInfo(),
               promptVersion: AI_CONFIG.promptVersion,
@@ -512,6 +524,55 @@ export async function runChatPipeline(args: {
       answerShape: plan.answerShape,
     });
 
+    /* ---------------------------------------------------------------------- */
+    /* 7b. The chart — the planner's proposal, checked against the real result */
+    /* ---------------------------------------------------------------------- */
+    // Deliberately not a model call. The planner already named a chart in the
+    // same request that wrote the SQL, and this step only verifies that the
+    // named columns exist, hold what the chart needs, and can honestly share an
+    // axis. A third provider request per question would fight the low-quota
+    // degradation the rest of this pipeline is built around.
+    let chart: ChartPayload | null = null;
+    let chartSpec: ChartSpec | null = null;
+    try {
+      chartSpec = resolveChartSpec({
+        suggestion: plan.visualization,
+        columns: result.columns,
+        rows: result.rows,
+        rowCount: result.rowCount,
+        answerShape: plan.answerShape,
+      });
+      chart =
+        chartSpec.type === "none"
+          ? null
+          : buildChartPayload({
+              spec: chartSpec,
+              // The full result, not the 200-row sample the response carries.
+              rows: result.rows,
+              truncated: result.truncated,
+            });
+    } catch (error: any) {
+      // The figures are already verified; a chart is an addition to the answer,
+      // never a precondition for it.
+      console.warn("[davis] chart selection failed:", error?.message || error);
+      chart = null;
+      chartSpec = null;
+    }
+
+    // The answer writer cannot see the page it is writing into. Told nothing,
+    // it falls back on "I am a text-based assistant" and denies the chart that
+    // is rendering directly beneath its own sentence — so it is told, including
+    // when the form it renders is not the one the user asked for.
+    const chartContext: AnswerChartContext | null = chartSpec
+      ? {
+          rendered: chart !== null,
+          typeLabel: CHART_TYPE_PROSE[chartSpec.type],
+          title: chartSpec.title,
+          reason: chartSpec.reason,
+          corrected: chartSpec.source === "planner-corrected",
+        }
+      : null;
+
     let answer: string;
     let proseMeta: CallMeta | null = null;
     let proseUnavailable = false;
@@ -556,6 +617,7 @@ export async function runChatPipeline(args: {
               answerShape: plan.answerShape,
               assumptions: plan.assumptions,
               chatHistory,
+              chart: chartContext,
             }),
           (r) => `${r.meta.modelUsed}${r.meta.degraded ? " (fallback)" : ""}`
         );
@@ -609,6 +671,7 @@ export async function runChatPipeline(args: {
         rowCount: result.rowCount,
         totalRowCount,
         truncated: result.truncated,
+        chart,
         degraded: Boolean(planMeta?.degraded || proseMeta?.degraded),
         proseUnavailable,
         answerTruncated,
@@ -623,6 +686,7 @@ export async function runChatPipeline(args: {
         selfCheck: plan.selfCheck,
         assumptions: plan.assumptions,
         answerShape: plan.answerShape,
+        chart,
         rowCount: result.rowCount,
         totalRowCount,
         truncated: result.truncated,
@@ -729,10 +793,22 @@ export async function runChatPipeline(args: {
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
 
-/** A repair must not quietly drop the assumptions the original plan made. */
+/**
+ * A repair must not quietly drop what the original plan established.
+ *
+ * Assumptions are unioned rather than replaced: the repair addressed a database
+ * error, it did not revisit the interpretation. The chart suggestion is kept
+ * only when the repair did not supply its own — a repair that renamed an alias
+ * is expected to restate the chart against the new names (rule R6), and its
+ * version is the one that matches the SQL that will actually run.
+ */
 function mergeAssumptions(previous: QueryPlan, repaired: QueryPlan): QueryPlan {
   const merged = new Set([...previous.assumptions, ...repaired.assumptions]);
-  return { ...repaired, assumptions: [...merged] };
+  return {
+    ...repaired,
+    assumptions: [...merged],
+    visualization: repaired.visualization ?? previous.visualization,
+  };
 }
 
 async function buildChatHistory(sessionId?: string): Promise<string> {

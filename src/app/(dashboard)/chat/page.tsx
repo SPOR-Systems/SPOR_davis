@@ -3,6 +3,20 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { DatabaseConnection } from "@/components/connections/AddConnectionModal";
 
+import dynamic from "next/dynamic";
+import type { ChartPayload } from "@/lib/ai/visualize";
+
+/**
+ * Recharts is around 90 kB of the chat bundle and most conversations start
+ * with a question whose answer is a sentence. Loading it on demand keeps the
+ * page fast to open, and ssr:false avoids the chart measuring itself against a
+ * zero-width server render before hydration corrects it.
+ */
+const ResultChart = dynamic(() => import("@/components/chat/ResultChart"), {
+  ssr: false,
+  loading: () => <div className="chart-card chart-loading" aria-hidden="true" />,
+});
+
 import ReactMarkdown from 'react-markdown';
 // Without remark-gfm, react-markdown does not implement GitHub-flavoured
 // markdown — so tables, strikethrough and task lists pass through as literal
@@ -53,6 +67,13 @@ interface Message {
   /** The steps DAVIS actually took, kept so the answer stays auditable. */
   trace?: TraceEntry[];
   thinkingMs?: number;
+  /** The chart the server chose and shaped, or null when none fits. */
+  chart?: ChartPayload | null;
+  /** The row sample, kept so the export buttons know there is a result. */
+  rows?: any[];
+  rowCount?: number;
+  /** Readings offered when DAVIS needs the question narrowed. */
+  clarifyingOptions?: string[];
 }
 
 const NOTICE_STYLES: Record<
@@ -228,6 +249,130 @@ function RetryCountdown({
   );
 }
 
+/**
+ * The readings offered with a clarifying question.
+ *
+ * These are a shortcut, not a gate: the input box stays live, so a user whose
+ * intent is none of the offered readings just types it. That matters because
+ * the alternative — a question with no options — makes the person retype the
+ * whole thing, which is most of why being asked to clarify feels like an
+ * obstacle rather than help.
+ */
+function ClarifyingOptions({
+  options,
+  onPick,
+  disabled,
+}: {
+  options: string[];
+  onPick: (option: string) => void;
+  disabled: boolean;
+}) {
+  if (!options.length) return null;
+
+  return (
+    <div className="clarify">
+      <ul className="clarify-list">
+        {options.map((option) => (
+          <li key={option}>
+            <button
+              type="button"
+              className="clarify-btn"
+              onClick={() => onPick(option)}
+              disabled={disabled}
+            >
+              {option}
+            </button>
+          </li>
+        ))}
+      </ul>
+      <p className="clarify-note">or describe what you need in your own words</p>
+    </div>
+  );
+}
+
+/**
+ * Download buttons for the result behind one answer.
+ *
+ * The href points at a server route that RE-RUNS the query rather than
+ * serialising the rows in this component's memory. The browser only ever holds
+ * a 200-row sample, and a spreadsheet that silently stops at row 200 while
+ * looking complete is precisely the kind of quiet wrongness this app is built
+ * to avoid.
+ */
+function ExportBar({
+  messageId,
+  rowCount,
+}: {
+  messageId: string;
+  rowCount: number;
+}) {
+  const [busy, setBusy] = useState<"xlsx" | "csv" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const download = async (format: "xlsx" | "csv") => {
+    setBusy(format);
+    setError(null);
+    try {
+      const res = await fetch(
+        `/api/chat/export?messageId=${encodeURIComponent(messageId)}&format=${format}`
+      );
+
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        setError(body?.error || "The export could not be built.");
+        return;
+      }
+
+      // The filename is decided by the server, in the Content-Disposition
+      // header, so the chat and the file agree on what the data is.
+      const disposition = res.headers.get("content-disposition") || "";
+      const match = /filename="?([^";]+)"?/i.exec(disposition);
+      const filename = match?.[1] || `davis-export.${format}`;
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      setError("Couldn't reach the server to build that file.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="export-bar">
+      <button
+        type="button"
+        className="export-btn"
+        onClick={() => download("xlsx")}
+        disabled={busy !== null}
+      >
+        {busy === "xlsx" ? "Building…" : "Excel"}
+      </button>
+      <button
+        type="button"
+        className="export-btn"
+        onClick={() => download("csv")}
+        disabled={busy !== null}
+      >
+        {busy === "csv" ? "Building…" : "CSV"}
+      </button>
+      <span className="export-note">
+        {rowCount > 0
+          ? "Re-runs the query, so the file holds the full result"
+          : "Re-runs the query behind this answer"}
+      </span>
+      {error && <span className="export-error">{error}</span>}
+    </div>
+  );
+}
+
 export default function DataChatPage() {
   const [connections, setConnections] = useState<DatabaseConnection[]>([]);
   const [selectedDb, setSelectedDb] = useState<string>("");
@@ -302,6 +447,12 @@ export default function DataChatPage() {
                 assumptions: data.assumptions,
                 rowCount: data.rowCount,
               },
+              chart: data.chart || null,
+              clarifyingOptions: Array.isArray(data.clarifyingOptions)
+                ? data.clarifyingOptions
+                : [],
+              rows: Array.isArray(data.rows) ? data.rows : [],
+              rowCount: typeof data.rowCount === "number" ? data.rowCount : 0,
               degraded: Boolean(data.degraded),
               proseUnavailable: Boolean(data.proseUnavailable),
               answerTruncated: Boolean(data.answerTruncated),
@@ -586,6 +737,32 @@ export default function DataChatPage() {
                       <p className="whitespace-pre-wrap">{msg.content}</p>
                     )}
                   </div>
+
+                  {msg.role === "ASSISTANT" &&
+                    (msg.clarifyingOptions?.length ?? 0) > 0 && (
+                      <ClarifyingOptions
+                        options={msg.clarifyingOptions || []}
+                        onPick={(option) => void send(option)}
+                        disabled={isLoading}
+                      />
+                    )}
+
+                  {/* The chart sits below the prose, never above it: the
+                      sentence is the answer and the chart is the shape of it.
+                      Every figure the chart shows is also in the text and in
+                      the export, so nothing depends on hovering a mark. */}
+                  {msg.role === "ASSISTANT" && msg.chart && (
+                    <ResultChart chart={msg.chart} />
+                  )}
+
+                  {msg.role === "ASSISTANT" &&
+                    msg.metadata?.sql &&
+                    (msg.rowCount ?? 0) > 0 && (
+                      <ExportBar
+                        messageId={msg.id}
+                        rowCount={msg.rowCount ?? 0}
+                      />
+                    )}
 
                   {/* Quiet footer when the answer came from a fallback path,
                       so a degraded answer is never mistaken for a normal one. */}

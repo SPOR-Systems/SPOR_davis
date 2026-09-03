@@ -6,6 +6,7 @@ import {
   buildSqlPrompt,
   PROMPT_VERSION,
 } from "@/lib/ai/prompts";
+import type { AnswerChartContext } from "@/lib/ai/prompts";
 import {
   callWithFallback,
   ModelConfigurationError,
@@ -348,6 +349,8 @@ async function generateText(
 /* JSON parsing                                                               */
 /* -------------------------------------------------------------------------- */
 
+import type { PlannerVisualization } from "@/lib/ai/visualize";
+
 export type QueryIntent =
   | "DATA_QUERY"
   | "RECALL_PREVIOUS_SQL"
@@ -363,7 +366,61 @@ export interface QueryPlan {
   sql: string;
   answerShape: AnswerShape;
   clarifyingQuestion: string;
+  /**
+   * Concrete readings the user can pick from, rendered as buttons. A
+   * clarifying question with no options makes the user type out what the
+   * planner could have offered, which is most of the reason clarification
+   * feels like an obstacle rather than a help.
+   */
+  clarifyingOptions: string[];
   selfCheck: string;
+  /**
+   * The chart the planner proposes. It is written before any row exists, so it
+   * is a hypothesis: lib/ai/visualize.ts re-checks every field against the
+   * result that actually came back and corrects what does not hold.
+   */
+  visualization: PlannerVisualization | null;
+}
+
+const CHART_TYPE_REQUESTS = [
+  "auto",
+  "none",
+  "stat",
+  "bar",
+  "hbar",
+  "line",
+  "area",
+  "pie",
+  "scatter",
+] as const;
+
+/**
+ * The model is asked for a specific object shape and mostly obliges, but a
+ * malformed chart suggestion must never cost the user their answer — the SQL
+ * ran and the figures are verified either way. Anything unparseable degrades
+ * to null, which means "choose the chart from the data alone".
+ */
+function normaliseVisualization(raw: any): PlannerVisualization | null {
+  if (!raw || typeof raw !== "object") return null;
+
+  const type = String(raw.type || "auto").toLowerCase().trim();
+  const y = Array.isArray(raw.y)
+    ? raw.y.map((v: any) => String(v || "").trim()).filter(Boolean)
+    : typeof raw.y === "string" && raw.y.trim()
+    ? [raw.y.trim()]
+    : [];
+
+  return {
+    type: (CHART_TYPE_REQUESTS as readonly string[]).includes(type)
+      ? (type as PlannerVisualization["type"])
+      : "auto",
+    x: String(raw.x || "").trim(),
+    y,
+    series: String(raw.series || "").trim(),
+    stacked: raw.stacked === true || String(raw.stacked).toLowerCase() === "true",
+    title: String(raw.title || "").trim(),
+    reason: String(raw.reason || "").trim(),
+  };
 }
 
 function stripFences(text: string): string {
@@ -415,7 +472,9 @@ export function normalisePlan(parsed: any, rawText: string): QueryPlan {
         sql: cleanSql(bare),
         answerShape: "ROW_SET",
         clarifyingQuestion: "",
+        clarifyingOptions: [],
         selfCheck: "",
+        visualization: null,
       };
     }
     // Never throw an unfalsifiable error again. Show the evidence.
@@ -461,7 +520,16 @@ export function normalisePlan(parsed: any, rawText: string): QueryPlan {
       ? String(parsed.answer_shape).toUpperCase()
       : "ROW_SET") as AnswerShape,
     clarifyingQuestion: String(parsed.clarifying_question || ""),
+    // Capped at four: past that the buttons wrap into a wall and picking one
+    // stops being faster than typing the answer.
+    clarifyingOptions: Array.isArray(parsed.clarifying_options)
+      ? parsed.clarifying_options
+          .map((o: any) => String(o || "").trim())
+          .filter(Boolean)
+          .slice(0, 4)
+      : [],
     selfCheck: String(parsed.self_check || ""),
+    visualization: normaliseVisualization(parsed.visualization),
   };
 }
 
@@ -525,6 +593,8 @@ export interface GenerateAnswerParams {
   answerShape: string;
   assumptions: string[];
   chatHistory?: string;
+  /** What is on screen beside the answer, so the model does not deny it. */
+  chart?: AnswerChartContext | null;
 }
 
 export async function generateConversationalAnswer(

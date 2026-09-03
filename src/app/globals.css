@@ -1612,3 +1612,268 @@ select.input {
     transition: none;
   }
 }
+/* ==========================================================================
+   RESULT CHARTS AND EXPORTS
+   --------------------------------------------------------------------------
+   The chart is part of an answer, not a dashboard tile, so it stays quiet:
+   hairline grid one shade off the surface, recessive axes, thin marks, and
+   generous padding. Anything louder competes with the sentence above it, and
+   the sentence is the answer.
+   ========================================================================== */
+
+.chart-card {
+  margin: var(--space-4) 0 0;
+  padding: var(--space-4);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+}
+
+.chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+  min-height: 24px;
+}
+
+.chart-title {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+/* --- Chart type switcher --- */
+
+.chart-switch {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.chart-switch-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  padding: 4px 9px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast);
+  white-space: nowrap;
+}
+
+.chart-switch-btn:hover {
+  color: var(--text-secondary);
+  background: var(--bg-surface-hover);
+}
+
+.chart-switch-btn.is-active {
+  color: var(--text-primary);
+  background: var(--bg-surface-elevated);
+}
+
+/* Sized to include the axis band, so the card never grows a nested
+   scrollbar that clips the tick labels. */
+.chart-plot {
+  width: 100%;
+}
+
+.chart-plot .recharts-surface {
+  overflow: visible;
+}
+
+/* --- Tooltip --- */
+
+.chart-tooltip {
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 8px 10px;
+  box-shadow: var(--shadow-md);
+  font-size: 0.75rem;
+  min-width: 120px;
+}
+
+.chart-tooltip-label {
+  color: var(--text-secondary);
+  font-size: 0.6875rem;
+  margin: 0 0 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.chart-tooltip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 3px 0;
+}
+
+.chart-tooltip-swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+
+/* Labels wear text tokens, never the series colour: the swatch beside them
+   already carries the identity. */
+.chart-tooltip-name {
+  color: var(--text-secondary);
+  margin-right: auto;
+}
+
+.chart-tooltip-value {
+  color: var(--text-primary);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Footer --- */
+
+.chart-foot {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+
+.chart-why {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.chart-why:hover {
+  color: var(--text-secondary);
+}
+
+.chart-note {
+  font-size: 0.6875rem;
+  color: var(--warning);
+}
+
+.chart-reason {
+  margin: var(--space-2) 0 0;
+  font-size: 0.6875rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* --- Export --- */
+
+.export-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.export-btn {
+  appearance: none;
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  padding: 5px 11px;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.export-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--border-hover);
+  background: var(--bg-surface-hover);
+}
+
+.export-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.export-note {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+}
+
+.export-error {
+  font-size: 0.6875rem;
+  color: var(--danger);
+  flex-basis: 100%;
+}
+
+/* Holds the card's footprint while the chart library loads, so the answer
+   above it does not jump when the chart arrives. */
+.chart-loading {
+  height: 280px;
+}
+
+/* --- Clarifying options -------------------------------------------------
+   Offered readings for a question DAVIS could not pin down. Styled as quiet
+   choices rather than primary actions: typing a different answer is equally
+   valid, so these must not read as the only way forward. */
+
+.clarify {
+  margin-top: var(--space-3);
+}
+
+.clarify-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.clarify-btn {
+  appearance: none;
+  text-align: left;
+  background: var(--bg-input);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 7px 12px;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.clarify-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--border-active);
+  background: var(--bg-surface-hover);
+}
+
+.clarify-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.clarify-note {
+  margin: var(--space-2) 0 0;
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+}
