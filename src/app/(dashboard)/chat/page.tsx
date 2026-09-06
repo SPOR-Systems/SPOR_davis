@@ -5,6 +5,10 @@ import { DatabaseConnection } from "@/components/connections/AddConnectionModal"
 
 import dynamic from "next/dynamic";
 import type { ChartPayload } from "@/lib/ai/visualize";
+import KnowledgeSources, {
+  type KnowledgeSource,
+} from "@/components/chat/KnowledgeSources";
+import SessionList from "@/components/chat/SessionList";
 
 /**
  * Recharts is around 90 kB of the chat bundle and most conversations start
@@ -74,6 +78,10 @@ interface Message {
   rowCount?: number;
   /** Readings offered when DAVIS needs the question narrowed. */
   clarifyingOptions?: string[];
+  /** Articles this answer was quoted from, when it came from the knowledge base. */
+  knowledgeSources?: KnowledgeSource[];
+  /** True when DAVIS declined to answer because nothing was documented. */
+  abstained?: boolean;
 }
 
 const NOTICE_STYLES: Record<
@@ -384,6 +392,8 @@ export default function DataChatPage() {
   const [lastQuestion, setLastQuestion] = useState<string>("");
   /** Stages for the request currently in flight. */
   const [liveTrace, setLiveTrace] = useState<TraceEntry[]>([]);
+  /** Bumped after each answer so the conversation list picks up new titles. */
+  const [sessionsToken, setSessionsToken] = useState(0);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -451,6 +461,10 @@ export default function DataChatPage() {
               clarifyingOptions: Array.isArray(data.clarifyingOptions)
                 ? data.clarifyingOptions
                 : [],
+              knowledgeSources: Array.isArray(data.knowledgeSources)
+                ? data.knowledgeSources
+                : [],
+              abstained: Boolean(data.abstained),
               rows: Array.isArray(data.rows) ? data.rows : [],
               rowCount: typeof data.rowCount === "number" ? data.rowCount : 0,
               degraded: Boolean(data.degraded),
@@ -584,10 +598,51 @@ export default function DataChatPage() {
       } finally {
         setIsLoading(false);
         setLiveTrace([]);
+        setSessionsToken((n) => n + 1);
       }
     },
     [selectedDb, isLoading, sessionId]
   );
+
+  /**
+   * Reopen a past conversation.
+   *
+   * The stored metadata is replayed, not just the text: an answer without its
+   * chart, citations and trace reads as a bare assertion, which is the opposite
+   * of what this application is for.
+   */
+  const openSession = useCallback(async (id: string) => {
+    try {
+      const res = await fetch(`/api/chat/sessions/${id}`);
+      if (!res.ok) return;
+      const data = await res.json();
+
+      setSessionId(id);
+      setMessages(
+        (data.messages || []).map((m: any) => ({
+          id: m.id,
+          role: m.role,
+          content: m.content,
+          metadata: m.metadata,
+          chart: m.metadata?.chart || null,
+          knowledgeSources: m.metadata?.knowledgeSources || [],
+          rows: [],
+          rowCount: m.metadata?.rowCount ?? 0,
+          trace: m.metadata?.trace || [],
+          thinkingMs: m.metadata?.latencyMs,
+          degraded: Boolean(m.metadata?.sqlModelDegraded),
+        }))
+      );
+    } catch {
+      /* leave the current conversation alone if it cannot be loaded */
+    }
+  }, []);
+
+  const startNewSession = useCallback(() => {
+    setSessionId(null);
+    setMessages([]);
+    setLastQuestion("");
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -607,7 +662,15 @@ export default function DataChatPage() {
   }, [lastQuestion, send]);
 
   return (
-    <div className="flex flex-col h-[calc(100vh-4rem)] bg-bg-main relative">
+    <div className="chat-shell">
+      <SessionList
+        activeId={sessionId}
+        onOpen={(id) => void openSession(id)}
+        onNew={startNewSession}
+        reloadToken={sessionsToken}
+      />
+
+    <div className="flex flex-col h-[calc(100vh-4rem)] bg-bg-main relative chat-main">
 
       {/* Header / Config Bar */}
       <div className="flex items-center justify-between pb-4 border-b border-border-subtle shrink-0">
@@ -739,6 +802,11 @@ export default function DataChatPage() {
                   </div>
 
                   {msg.role === "ASSISTANT" &&
+                    (msg.knowledgeSources?.length ?? 0) > 0 && (
+                      <KnowledgeSources sources={msg.knowledgeSources || []} />
+                    )}
+
+                  {msg.role === "ASSISTANT" &&
                     (msg.clarifyingOptions?.length ?? 0) > 0 && (
                       <ClarifyingOptions
                         options={msg.clarifyingOptions || []}
@@ -822,6 +890,7 @@ export default function DataChatPage() {
           <p className="absolute -top-6 left-2 text-xs text-warning">Please select a database connection first.</p>
         )}
       </form>
+    </div>
     </div>
   );
 }

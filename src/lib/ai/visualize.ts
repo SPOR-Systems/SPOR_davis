@@ -209,7 +209,7 @@ export function profileColumns(columns: string[], rows: any[]): ColumnProfile[] 
       role = "temporal";
     } else if (identifier) {
       // An identifier is a label even when it is stored as a number. Plotting
-      // the sum of encounter IDs is meaningless, so it is never a measure.
+      // the sum of order IDs is meaningless, so it is never a measure.
       role = "identifier";
     } else if (numeric) {
       role = "measure";

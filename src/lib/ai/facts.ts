@@ -27,9 +27,9 @@ function isNumeric(v: any): boolean {
 }
 
 /**
- * Identifiers are labels, not quantities. Encounter 1200 is not "1,200" — a
+ * Identifiers are labels, not quantities. Order 1200 is not "1,200" — a
  * grouped identifier reads as a measurement and cannot be pasted back into a
- * query or looked up in a source system. Years, postal codes and NPI-style
+ * query or looked up in a source system. Years, postal codes and reference
  * numbers have the same problem.
  */
 const IDENTIFIER_TOKENS = new Set([
@@ -53,8 +53,8 @@ const IDENTIFIER_TOKENS = new Set([
 ]);
 
 export function isIdentifierColumn(name: string): boolean {
-  // The model aliases columns freely — SYS_ENC_ID, "Encounter ID", encounterId
-  // and encounter-id are all the same thing — so split on every plausible word
+  // The model aliases columns freely — SYS_ORD_ID, "Order ID", orderId and
+  // order-id are all the same thing — so split on every plausible word
   // boundary, including camelCase, before matching whole tokens.
   const tokens = String(name || "")
     .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
@@ -138,7 +138,7 @@ export function buildFactSheet(input: FactSheetInput): string {
   // Multi-row: give per-column aggregates computed here, in code.
   // Summing or averaging an identifier column is meaningless, so identifiers
   // are excluded from the aggregate block entirely — offering "sum of
-  // encounter ids" invites the model to quote a nonsense figure.
+  // order ids" invites the model to quote a nonsense figure.
   const numericCols = columns.filter(
     (c) => !isIdentifierColumn(c) && rows.some((r) => isNumeric(r[c]))
   );

@@ -30,6 +30,38 @@ export default function ConnectionsPage() {
     setConnections([newConnection, ...connections]);
   };
 
+  const [armed, setArmed] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const removeConnection = async (id: string, name: string) => {
+    setDeleting(id);
+    setNotice(null);
+    try {
+      const res = await fetch(`/api/connections/${id}`, { method: "DELETE" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        setNotice(data?.error || `${name} could not be removed.`);
+        return;
+      }
+      setConnections((prev) => prev.filter((c) => c.id !== id));
+      // Past answers survive a deleted connection but lose the link back to
+      // it. Saying how many is more useful than a bare "deleted".
+      if (data?.messagesUnlinked > 0) {
+        setNotice(
+          `${name} removed. ${data.messagesUnlinked} past answer${
+            data.messagesUnlinked === 1 ? "" : "s"
+          } kept their figures but no longer link back to it.`
+        );
+      }
+    } catch {
+      setNotice(`${name} could not be removed.`);
+    } finally {
+      setDeleting(null);
+      setArmed(null);
+    }
+  };
+
   const getDbLogo = (type: string) => {
     switch (type) {
       case "POSTGRESQL": return { abbr: "PG", color: "#336791" };
@@ -79,6 +111,8 @@ export default function ConnectionsPage() {
             Add Connection
           </button>
         </div>
+
+        {notice && <div className="kb-notice" style={{ marginBottom: "1rem" }}>{notice}</div>}
 
         {loading ? (
           <div className="flex justify-center py-20">
@@ -139,13 +173,42 @@ export default function ConnectionsPage() {
                     </div>
                   </div>
 
-                  {/* Actions overlay */}
-                  <div className="absolute top-4 right-4 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button className="p-2 bg-bg-elevated hover:bg-brand-primary hover:text-white border border-border-subtle rounded-md transition-colors text-text-secondary" title="Test Connection">
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <polyline points="20 6 9 17 4 12" />
-                      </svg>
-                    </button>
+                  {/* Removing a connection revokes DAVIS's access to that
+                      database. It does not touch the database itself, and past
+                      answers keep their figures — so the confirmation says
+                      exactly that rather than a generic "are you sure". */}
+                  <div className="conn-actions">
+                    {armed === conn.id ? (
+                      <span className="kb-confirm">
+                        <span className="kb-confirm-text">
+                          Remove DAVIS&apos;s access to {conn.name}? The database itself is
+                          untouched.
+                        </span>
+                        <button
+                          type="button"
+                          className="kb-delete kb-delete-armed"
+                          onClick={() => void removeConnection(conn.id, conn.name)}
+                          disabled={deleting === conn.id}
+                        >
+                          {deleting === conn.id ? "Removing…" : "Yes, remove"}
+                        </button>
+                        <button
+                          type="button"
+                          className="kb-secondary"
+                          onClick={() => setArmed(null)}
+                        >
+                          Cancel
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="kb-delete"
+                        onClick={() => setArmed(conn.id)}
+                      >
+                        Remove
+                      </button>
+                    )}
                   </div>
                 </div>
               );

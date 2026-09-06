@@ -23,6 +23,7 @@ model Organization {
   knowledgeBases      KnowledgeBase[]
   chatSessions        ChatSession[]
   auditLogs           AuditLog[]
+  knowledgeGaps       KnowledgeGap[]
 
   @@map("organizations")
 }
@@ -86,7 +87,10 @@ model KnowledgeBase {
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
-  documents Document[]
+  documents   Document[]
+  articles    Article[]
+  definitions Definition[]
+  conflicts   KnowledgeConflict[]
 
   @@map("knowledge_bases")
 }
@@ -96,17 +100,31 @@ model Document {
   name        String
   type        String
   size        Int            // bytes
-  status      String         @default("PENDING")
+  status      String         @default("PENDING")   // PENDING | EXTRACTING | EMBEDDING | READY | FAILED
   sourceUrl   String?        // For web-scraped documents
   errorMessage String?
+
+  // ── Ingest metadata ──
+  contentHash   String?   // sha256 of the raw bytes, so a re-upload is detected
+  extractedText String?   // full plain text, kept so re-chunking never re-parses
+  pageCount     Int?
+  ingestError   String?   // why extraction failed, surfaced in the UI
+  /// Knowledge articles are readable by everyone in the organisation. Set when
+  /// the extracted text looks like it carries personal identifiers — names,
+  /// dates of birth, account or record numbers — so a human reviews before
+  /// anything derived from it is published.
+  containsSensitiveData Boolean @default(false)
+  sensitiveFindings     String? // JSON array of what the scan matched on
   createdAt   DateTime       @default(now())
   updatedAt   DateTime       @updatedAt
 
   knowledgeBaseId String
   knowledgeBase   KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
 
-  chunks DocumentChunk[]
+  chunks   DocumentChunk[]
+  articles Article[]
 
+  @@index([knowledgeBaseId, contentHash])
   @@map("documents")
 }
 
@@ -114,8 +132,13 @@ model DocumentChunk {
   id        String   @id @default(cuid())
   content   String   // The text chunk
   metadata  String?  // Page number, section, etc. (stored as stringified JSON)
-  embedding Bytes?   // Vector embedding (stored as binary for pgvector compatibility)
+  /// Float32Array serialised little-endian. Chunks are an INDEX, not the
+  /// reading material: retrieval scores against these, then loads the whole
+  /// parent article. See lib/knowledge/retrieve.ts.
+  embedding Bytes?
   chunkIndex Int     // Order within document
+  tokenCount Int?
+  headingPath String? // "Billing > Refunds > Timelines" — context for a citation
   createdAt DateTime @default(now())
 
   documentId String
@@ -179,4 +202,162 @@ model AuditLog {
 
   @@index([organizationId, createdAt])
   @@map("audit_logs")
+}
+
+// ── Knowledge Atlas ──
+//
+// The split that makes the whole thing work:
+//   Document — a raw uploaded file. The SOURCE. Immutable once ingested.
+//   Article  — a structured unit in the Atlas tree. The KNOWLEDGE.
+//
+// A citation points at an Article — path, title, version — which is a thing a
+// person can open and check. "Chunk 47 of a PDF" is not.
+
+model Article {
+  id    String @id @default(cuid())
+  path  String // "Billing/Patient Accounts/No-show Charges" — position in the tree
+  title String
+
+  /// Selects the ANSWERING CONTRACT, not just a label:
+  ///   PROCEDURE — rendered complete and in order from `steps`, never paraphrased
+  ///   POLICY    — quoted and attributed, never softened into a summary
+  ///   REFERENCE — may be summarised, still cited
+  ///   DEFINITION— feeds Definition (Phase 5); never supplies a value
+  kind String @default("REFERENCE")
+
+  body  String  // markdown
+  /// Ordered steps as JSON when kind = PROCEDURE. Structured rather than prose
+  /// so "every step, in order" is mechanically checkable instead of a hope: a
+  /// dropped step in a billing procedure is a wrong instruction, not a short answer.
+  steps String?
+
+  status     String @default("DRAFT") // DRAFT | PUBLISHED | ARCHIVED
+  version    Int    @default(1)
+  /// 0–1. Machine-generated and unreviewed articles sit low and are marked as
+  /// such in the UI until a human has looked at them.
+  confidence Float?
+  embedding  Bytes? // one vector for the whole article
+
+  sourceKind       String  @default("MANUAL") // MANUAL | DOCUMENT | CHAT
+  sourceDocumentId String?
+  sourceMessageId  String? // provenance back to the exchange that produced it
+
+  reviewedAt   DateTime?
+  reviewedById String?
+
+  answersServed Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  knowledgeBaseId String
+  knowledgeBase   KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+
+  sourceDocument Document? @relation(fields: [sourceDocumentId], references: [id], onDelete: SetNull)
+
+  versions    ArticleVersion[]
+  definitions Definition[]
+
+  @@index([knowledgeBaseId, path])
+  @@index([knowledgeBaseId, status])
+  @@map("articles")
+}
+
+model ArticleVersion {
+  id          String   @id @default(cuid())
+  version     Int
+  title       String
+  body        String
+  steps       String?
+  changedById String?
+  changeNote  String?
+  createdAt   DateTime @default(now())
+
+  articleId String
+  article   Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@unique([articleId, version])
+  @@map("article_versions")
+}
+
+model Definition {
+  id      String @id @default(cuid())
+  term    String // "active patient", "over 50"
+  meaning String // prose. Always required — an expression with no meaning is unreviewable.
+
+  /// The IMPLEMENTATION, executed live on every question. A definition stores an
+  /// expression and never a value, so it cannot serve a stale figure.
+  sqlExpression String?
+  tablesTouched String  @default("[]") // JSON array of identifiers it depends on
+  /// Hash of the live shape of those identifiers. Re-checked at use time; a
+  /// mismatch marks the definition STALE and withholds it from the prompt.
+  schemaFingerprint String?
+
+  status String @default("DRAFT") // DRAFT | PUBLISHED | STALE | CONFLICTED
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  knowledgeBaseId String
+  knowledgeBase   KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+
+  articleId String?
+  article   Article? @relation(fields: [articleId], references: [id], onDelete: SetNull)
+
+  @@unique([knowledgeBaseId, term])
+  @@map("definitions")
+}
+
+/// What DAVIS could not answer. Mined from chat metadata that is ALREADY being
+/// written — no new instrumentation.
+model KnowledgeGap {
+  id String @id @default(cuid())
+
+  /// UNDEFINED_TERM        — an assumption restated repeatedly with no definition behind it
+  /// FAILED_QUERY          — a question that died after every repair attempt
+  /// REPEATED_CLARIFICATION— the same ambiguity asked about again and again
+  /// UNCOVERED_TERM        — a frequent word matching nothing in schema or KB
+  /// UNANSWERED_KNOWLEDGE  — a knowledge question that retrieved nothing above threshold
+  kind String
+
+  label             String
+  occurrences       Int      @default(1)
+  lastSeenAt        DateTime @default(now())
+  exampleMessageIds String   @default("[]") // JSON array
+
+  status              String  @default("OPEN") // OPEN | RESOLVED | DISMISSED
+  resolvedByArticleId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, kind, label])
+  @@index([organizationId, status, occurrences])
+  @@map("knowledge_gaps")
+}
+
+model KnowledgeConflict {
+  id         String @id @default(cuid())
+  kind       String // DUPLICATE | CONTRADICTION | SUPERSEDED
+  targetType String // ARTICLE | DEFINITION
+  leftId     String
+  rightId    String
+  /// Why the model believes these disagree. The system flags; a person decides.
+  explanation String
+  similarity  Float?
+
+  status     String  @default("OPEN") // OPEN | RESOLVED | DISMISSED
+  resolution String? // KEEP_LEFT | KEEP_RIGHT | MERGED | BOTH_VALID
+  resolvedById String?
+  resolvedAt   DateTime?
+
+  createdAt DateTime @default(now())
+
+  knowledgeBaseId String
+  knowledgeBase   KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+
+  @@index([knowledgeBaseId, status])
+  @@map("knowledge_conflicts")
 }

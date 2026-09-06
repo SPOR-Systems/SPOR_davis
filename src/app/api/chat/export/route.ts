@@ -129,7 +129,7 @@ async function toXlsx(args: {
   header.height = 20;
 
   // Identifiers are written as text. Excel will happily turn an eight-digit
-  // MRN into 1.2346E+07, or strip the leading zero off a postal code, and the
+  // account number into 1.2346E+07, or strip the leading zero off a postal code, and the
   // person who opens the file has no way to tell it happened.
   const identifierCols = new Set(
     args.columns.filter((c) => isIdentifierColumn(c))

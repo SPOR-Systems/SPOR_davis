@@ -81,7 +81,7 @@ export default function DashboardOverview() {
             </div>
           </Link>
 
-          <Link href="/dashboard/knowledge" className="group p-6 bg-bg-elevated border border-border-subtle rounded-xl hover:border-teal-primary/50 transition-colors flex items-start gap-4">
+          <Link href="/knowledge" className="group p-6 bg-bg-elevated border border-border-subtle rounded-xl hover:border-teal-primary/50 transition-colors flex items-start gap-4">
             <div className="w-12 h-12 rounded-lg bg-teal-primary/10 text-teal-light flex items-center justify-center group-hover:bg-teal-primary group-hover:text-white transition-colors">
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />

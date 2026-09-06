@@ -42,6 +42,14 @@ import {
   type ChartSpec,
 } from "@/lib/ai/visualize";
 import type { AnswerChartContext } from "@/lib/ai/prompts";
+import { renderNotDocumented } from "@/lib/ai/prompts";
+import { generateKnowledgeAnswer } from "@/lib/ai/gemini";
+import { decideRoute } from "@/lib/knowledge/router";
+import {
+  getOrCreateKnowledgeBase,
+  retrieve,
+  type RetrievalResult,
+} from "@/lib/knowledge/retrieve";
 
 /**
  * ============================================================================
@@ -64,6 +72,8 @@ import type { AnswerChartContext } from "@/lib/ai/prompts";
  */
 
 export type StageId =
+  | "route"
+  | "knowledge"
   | "schema"
   | "history"
   | "plan"
@@ -209,6 +219,69 @@ export async function runChatPipeline(args: {
     const chatHistory = await buildChatHistory(sessionId);
 
     /* ---------------------------------------------------------------------- */
+    /* 2b. Pre-route — can this skip planning entirely?                       */
+    /* ---------------------------------------------------------------------- */
+    // One embedding call (~100ms, separate quota) instead of a planner call
+    // carrying the whole schema (20-40s). For a support agent with a customer
+    // waiting, that difference is the difference between a usable answer and
+    // one that arrives after the call ended.
+    //
+    // Ambiguity always resolves to the planner: answering a DATA question from
+    // documents would serve a stale figure as current, which is the one thing
+    // the knowledge base is forbidden to do.
+    const knowledgeBase = await getOrCreateKnowledgeBase(user.organizationId).catch(
+      () => null
+    );
+
+    const decision = await step(
+      "route",
+      "Working out what kind of question this is",
+      () =>
+        decideRoute({
+          question,
+          knowledgeBaseId: knowledgeBase?.id ?? null,
+          schema: schemaCtx,
+        }),
+      (d) => `${d.route === "KNOWLEDGE_FAST_PATH" ? "documented knowledge" : "data"} — ${d.reason}`
+    );
+
+    if (decision.route === "KNOWLEDGE_FAST_PATH" && decision.retrieval) {
+      const result = await answerFromKnowledge({
+        question,
+        retrieval: decision.retrieval,
+        chatHistory,
+        hasDatabase: true,
+        emit,
+        trace,
+      });
+
+      return await persist({
+        question,
+        answer: result.answer,
+        sessionId,
+        user,
+        connectionId,
+        trace,
+        extra: {
+          knowledgeSources: result.sources,
+          abstained: result.abstained,
+        },
+        metadata: {
+          status: result.abstained ? "not_documented" : "knowledge_answer",
+          intent: "KNOWLEDGE_QUERY",
+          route: "fast_path",
+          routeReason: decision.reason,
+          knowledgeSources: result.sources,
+          topScore: decision.topScore,
+          proseModelUsed: result.modelUsed,
+          plannerSkipped: true,
+          promptVersion: AI_CONFIG.promptVersion,
+          latencyMs: Date.now() - startedAt,
+        },
+      });
+    }
+
+    /* ---------------------------------------------------------------------- */
     /* 3. Plan — from cache when we have planned this exact question before   */
     /* ---------------------------------------------------------------------- */
     const todayISO = new Date().toISOString().slice(0, 10);
@@ -269,6 +342,53 @@ export async function runChatPipeline(args: {
     /* ---------------------------------------------------------------------- */
     /* 4. Route on intent                                                     */
     /* ---------------------------------------------------------------------- */
+
+    /* The planner decided this is documented knowledge after all — either the
+       pre-router was not confident enough, or the question named a schema
+       identifier while still being about a process. Retrieval runs now (the
+       pre-router did not, or found too little to shortcut on). */
+    if (plan.intent === "KNOWLEDGE_QUERY") {
+      const retrieval =
+        decision.retrieval && !decision.retrieval.empty
+          ? decision.retrieval
+          : knowledgeBase
+          ? await retrieve({ question, knowledgeBaseId: knowledgeBase.id })
+          : { sources: [], topScore: 0, empty: true };
+
+      const result = await answerFromKnowledge({
+        question,
+        retrieval,
+        chatHistory,
+        hasDatabase: true,
+        emit,
+        trace,
+      });
+
+      return await persist({
+        question,
+        answer: result.answer,
+        sessionId,
+        user,
+        connectionId,
+        trace,
+        extra: {
+          knowledgeSources: result.sources,
+          abstained: result.abstained,
+        },
+        metadata: {
+          status: result.abstained ? "not_documented" : "knowledge_answer",
+          intent: plan.intent,
+          route: "planner",
+          routeReason: decision.reason,
+          knowledgeSources: result.sources,
+          topScore: retrieval.topScore,
+          ...modelInfo(),
+          proseModelUsed: result.modelUsed,
+          promptVersion: AI_CONFIG.promptVersion,
+          latencyMs: Date.now() - startedAt,
+        },
+      });
+    }
 
     if (plan.intent === "NOT_DATA_RELATED") {
       const { answer, meta } = await step(
@@ -348,6 +468,43 @@ export async function runChatPipeline(args: {
           latencyMs: Date.now() - startedAt,
         },
       });
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* 4b. HYBRID — the documented half, answered separately                  */
+    /* ---------------------------------------------------------------------- */
+    // Two answers, not one. A policy and a live count are different kinds of
+    // claim with different provenance, and merging them into one paragraph is
+    // exactly how a documented figure ends up reading as a measured one. The
+    // cost is a second prose call; the alternative is an answer nobody can audit.
+    let hybridKnowledge: {
+      answer: string;
+      sources: KnowledgeCitation[];
+    } | null = null;
+
+    if (plan.intent === "HYBRID" && knowledgeBase) {
+      try {
+        const retrieval =
+          decision.retrieval && !decision.retrieval.empty
+            ? decision.retrieval
+            : await retrieve({ question, knowledgeBaseId: knowledgeBase.id });
+
+        if (!retrieval.empty) {
+          const result = await answerFromKnowledge({
+            question,
+            retrieval,
+            chatHistory,
+            hasDatabase: true,
+            emit,
+            trace,
+          });
+          hybridKnowledge = { answer: result.answer, sources: result.sources };
+        }
+      } catch (error: any) {
+        // The data half can still be answered. Losing the documented half is a
+        // partial answer; failing the question is not an improvement.
+        console.warn("[davis] hybrid knowledge half failed:", error?.message || error);
+      }
     }
 
     /* ---------------------------------------------------------------------- */
@@ -656,14 +813,32 @@ export async function runChatPipeline(args: {
       }
     }
 
+    // The two halves stay visibly apart, under their own headings, each with
+    // its own citation. A reader must never have to guess which sentence was
+    // measured and which was quoted.
+    const composedAnswer = hybridKnowledge
+      ? [
+          "**From your documentation**",
+          "",
+          hybridKnowledge.answer,
+          "",
+          "---",
+          "",
+          "**From the database**",
+          "",
+          answer,
+        ].join("\n")
+      : answer;
+
     return await persist({
       question,
-      answer,
+      answer: composedAnswer,
       sessionId,
       user,
       connectionId,
       trace,
       extra: {
+        knowledgeSources: hybridKnowledge?.sources ?? [],
         sql: plan.sql,
         assumptions: plan.assumptions,
         columns: result.columns,
@@ -680,6 +855,9 @@ export async function runChatPipeline(args: {
       metadata: {
         status: "success",
         intent: plan.intent,
+        route: "planner",
+        routeReason: decision.reason,
+        knowledgeSources: hybridKnowledge?.sources ?? [],
         sql: plan.sql,
         executedSql: result.executedSql,
         plan: plan.plan,
@@ -905,4 +1083,100 @@ async function persist(args: {
       ...(extra || {}),
     },
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Knowledge answers                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Turn a retrieval result into an answer, or into an honest refusal.
+ *
+ * The refusal path deliberately does NOT call a model. Retrieval has already
+ * established that nothing is close enough; asking a model to say so would add
+ * a request and several seconds to the one case where the reader most needs a
+ * fast answer, and would give it room to talk itself into a guess.
+ */
+async function answerFromKnowledge(args: {
+  question: string;
+  retrieval: RetrievalResult;
+  chatHistory: string;
+  hasDatabase: boolean;
+  emit: Emit;
+  trace: TraceEntry[];
+}): Promise<{ answer: string; sources: KnowledgeCitation[]; abstained: boolean; modelUsed: string }> {
+  const { question, retrieval, chatHistory, hasDatabase, emit, trace } = args;
+
+  if (retrieval.empty || retrieval.sources.length === 0) {
+    const detail = retrieval.unavailable
+      ? "knowledge base unavailable"
+      : `nothing above the relevance floor (best ${retrieval.topScore.toFixed(2)})`;
+    emit({ t: "stage", id: "knowledge", label: "Searching documented knowledge" });
+    trace.push({ id: "knowledge", label: "Searching documented knowledge", detail, ms: 0 });
+    emit({ t: "stage_end", id: "knowledge", detail, ms: 0 });
+
+    return {
+      answer: renderNotDocumented({ question }),
+      sources: [],
+      abstained: true,
+      modelUsed: "none",
+    };
+  }
+
+  const t0 = Date.now();
+  emit({ t: "stage", id: "knowledge", label: "Reading the documentation" });
+
+  const { answer, meta } = await generateKnowledgeAnswer({
+    question,
+    chatHistory,
+    hasDatabase,
+    sources: retrieval.sources.map((s) => ({
+      path: s.path,
+      title: s.title,
+      kind: s.kind,
+      version: s.version,
+      body: s.body,
+      steps: s.steps,
+      score: s.score,
+      citation: s.citation,
+    })),
+  });
+
+  const ms = Date.now() - t0;
+  const detail =
+    `${retrieval.sources.length} source${retrieval.sources.length === 1 ? "" : "s"} read whole · ` +
+    `best match ${retrieval.topScore.toFixed(2)} · ${meta.modelUsed}`;
+  trace.push({ id: "knowledge", label: "Reading the documentation", detail, ms });
+  emit({ t: "stage_end", id: "knowledge", detail, ms });
+
+  return {
+    answer,
+    sources: retrieval.sources.map((s) => ({
+      articleId: s.articleId,
+      documentId: s.documentId,
+      path: s.path,
+      title: s.title,
+      kind: s.kind,
+      version: s.version,
+      score: Number(s.score.toFixed(3)),
+      confidence: s.confidence ?? null,
+      citation: s.citation,
+      headingPath: s.headingPath ?? null,
+    })),
+    abstained: false,
+    modelUsed: meta.modelUsed,
+  };
+}
+
+export interface KnowledgeCitation {
+  articleId: string | null;
+  documentId: string | null;
+  path: string;
+  title: string;
+  kind: string;
+  version: number;
+  score: number;
+  confidence: number | null;
+  citation: string;
+  headingPath: string | null;
 }

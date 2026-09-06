@@ -40,7 +40,7 @@ import {
  *    Two scales on one plot invent a correlation the data does not contain, and
  *    the server has already dropped any measure that cannot share the axis.
  *  - COLOUR FOLLOWS THE SERIES INDEX, NOT THE VALUE. A palette applied by rank
- *    repaints on every re-sort, so a reader who learned "blue is Cardiology"
+ *    repaints on every re-sort, so a reader who learned "blue is the Western region"
  *    gets a different answer next time. Single-series charts use one colour for
  *    every bar rather than a value ramp: a ramp double-encodes bar length as
  *    hue and burns the only free channel on information the chart already

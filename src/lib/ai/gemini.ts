@@ -5,8 +5,12 @@ import {
   buildRepairPrompt,
   buildSqlPrompt,
   PROMPT_VERSION,
+  buildKnowledgePrompt,
 } from "@/lib/ai/prompts";
-import type { AnswerChartContext } from "@/lib/ai/prompts";
+import type {
+  AnswerChartContext,
+  KnowledgePromptInput,
+} from "@/lib/ai/prompts";
 import {
   callWithFallback,
   ModelConfigurationError,
@@ -353,6 +357,8 @@ import type { PlannerVisualization } from "@/lib/ai/visualize";
 
 export type QueryIntent =
   | "DATA_QUERY"
+  | "KNOWLEDGE_QUERY"
+  | "HYBRID"
   | "RECALL_PREVIOUS_SQL"
   | "NEEDS_CLARIFICATION"
   | "NOT_DATA_RELATED";
@@ -501,6 +507,8 @@ export function normalisePlan(parsed: any, rawText: string): QueryPlan {
 
   const validIntents: QueryIntent[] = [
     "DATA_QUERY",
+    "KNOWLEDGE_QUERY",
+    "HYBRID",
     "RECALL_PREVIOUS_SQL",
     "NEEDS_CLARIFICATION",
     "NOT_DATA_RELATED",
@@ -619,6 +627,26 @@ export async function generateNonDataReply(params: {
     PROSE_MODEL_CHAIN,
     prompt,
     "non-data reply"
+  );
+  return { answer: text.trim(), meta };
+}
+
+/**
+ * Answer from documented knowledge.
+ *
+ * Runs on the PROSE chain, not the SQL chain. The work here is faithful
+ * reproduction of source material, not multi-step reasoning — and the prose
+ * chain is the cheaper, higher-capacity tier, which is what the sub-five-second
+ * target for this path depends on.
+ */
+export async function generateKnowledgeAnswer(
+  params: KnowledgePromptInput
+): Promise<{ answer: string; meta: CallMeta }> {
+  const prompt = buildKnowledgePrompt(params);
+  const { text, meta } = await generateText(
+    PROSE_MODEL_CHAIN,
+    prompt,
+    "answer from knowledge"
   );
   return { answer: text.trim(), meta };
 }
