@@ -43,7 +43,11 @@ import {
 } from "@/lib/ai/visualize";
 import type { AnswerChartContext } from "@/lib/ai/prompts";
 import { renderNotDocumented } from "@/lib/ai/prompts";
-import { generateKnowledgeAnswer } from "@/lib/ai/gemini";
+import {
+  generateKnowledgeAnswer,
+  generateSchemaOverview,
+} from "@/lib/ai/gemini";
+import { buildSchemaSummary } from "@/lib/db/schemaSummary";
 import { decideRoute } from "@/lib/knowledge/router";
 import {
   getOrCreateKnowledgeBase,
@@ -91,6 +95,16 @@ export interface TraceEntry {
 }
 
 export type StreamEvent =
+  /**
+   * Sent before any work begins, as soon as the conversation row exists.
+   *
+   * Previously the client learned the session id only in the final "done"
+   * event, which meant a brand-new conversation had no identity for the twenty
+   * seconds it was being answered — it could not be listed, could not be marked
+   * as working, and if the user navigated away in that window it was
+   * unreachable afterwards even though the server had created it.
+   */
+  | { t: "session"; sessionId: string; title: string }
   | { t: "stage"; id: StageId; label: string }
   | { t: "stage_end"; id: StageId; detail?: string; ms: number }
   | { t: "done"; status: number; body: any }
@@ -140,6 +154,11 @@ export async function runChatPipeline(args: {
   const { user, body } = args;
   const startedAt = Date.now();
   const trace: TraceEntry[] = [];
+  /**
+   * Set as soon as the conversation exists, so even a failure can tell the
+   * client where the question went.
+   */
+  let resolvedSessionId: string | undefined;
 
   const emit: Emit = args.emit || (() => {});
 
@@ -171,52 +190,123 @@ export async function runChatPipeline(args: {
   try {
     const { question, connectionId, sessionId, refreshSchema } = body || {};
 
-    if (!question || !connectionId) {
+    if (!question) {
       return {
         status: 400,
-        body: { error: "Question and connectionId are required", code: "BAD_REQUEST" },
+        body: { error: "A question is required", code: "BAD_REQUEST" },
       };
     }
 
-    const conn = await prisma.databaseConnection.findFirst({
-      where: { id: connectionId, organizationId: user.organizationId },
+    /* ---------------------------------------------------------------------- */
+    /* 0. The question is durable before anything can fail                    */
+    /* ---------------------------------------------------------------------- */
+    // The session and the user's message used to be written at the END, inside
+    // persist(), which had two consequences that both look like bugs to a user:
+    //
+    //   A new conversation had no id until it was answered, so it could not be
+    //   shown in the list or marked as working, and navigating away during
+    //   those twenty seconds left it unreachable.
+    //
+    //   Worse: every error path returns before persist() is ever called. A
+    //   quota error, a timeout or a provider outage threw the question away
+    //   entirely — the user watched it fail and then could not even see what
+    //   they had asked.
+    //
+    // Writing it first costs one insert and makes the question survive whatever
+    // happens next.
+    const session = sessionId
+      ? await prisma.chatSession.findFirst({
+          where: { id: sessionId, userId: user.userId, organizationId: user.organizationId },
+        })
+      : await prisma.chatSession.create({
+          data: {
+            title: question.slice(0, 60),
+            userId: user.userId,
+            organizationId: user.organizationId,
+          },
+        });
+
+    if (!session) {
+      return {
+        status: 404,
+        body: { error: "Conversation not found", code: "NOT_FOUND" },
+      };
+    }
+
+    resolvedSessionId = session.id;
+    emit({ t: "session", sessionId: session.id, title: session.title });
+
+    const userMessage = await prisma.chatMessage.create({
+      data: {
+        sessionId: session.id,
+        role: "USER",
+        content: question,
+        connectionId: body?.connectionId || null,
+      },
     });
-    if (!conn) {
+
+    /* ---------------------------------------------------------------------- */
+    /* A database is OPTIONAL                                                 */
+    /* ---------------------------------------------------------------------- */
+    // An organisation may have documents and no connection at all — a support
+    // team using this purely as a knowledge assistant never needs one. The
+    // knowledge path was always independent of the database; requiring a
+    // connection to reach it was an accident of the original chat page, and it
+    // made the product unusable for anyone without a database to point at.
+    const conn = connectionId
+      ? await prisma.databaseConnection.findFirst({
+          where: { id: connectionId, organizationId: user.organizationId },
+        })
+      : null;
+
+    if (connectionId && !conn) {
       return {
         status: 404,
         body: { error: "Database connection not found", code: "NO_CONNECTION" },
       };
     }
 
-    const dialect = dialectLabel(conn.type);
+    const dialect = conn ? dialectLabel(conn.type) : "";
 
     /* ---------------------------------------------------------------------- */
     /* 1. Schema context (cached; profiled from the live database)            */
     /* ---------------------------------------------------------------------- */
-    const schemaCtx = await step(
-      "schema",
-      "Reading the database schema",
-      () =>
-        getSchemaContext(connectionId, user.organizationId, {
-          forceRefresh: Boolean(refreshSchema),
-        }),
-      (ctx) => {
-        const valueLists = ctx.tables.reduce(
-          (n, t) => n + t.columns.filter((c) => c.enumValues?.length).length,
-          0
+    const schemaCtx = !conn
+      ? null
+      : await step(
+          "schema",
+          "Reading the database schema",
+          () =>
+            getSchemaContext(connectionId, user.organizationId, {
+              forceRefresh: Boolean(refreshSchema),
+            }),
+          (ctx) => {
+            const valueLists = ctx.tables.reduce(
+              (n, t) => n + t.columns.filter((c) => c.enumValues?.length).length,
+              0
+            );
+
+            const base =
+              `${ctx.tables.length} tables · ${ctx.foreignKeys.length} join paths · ` +
+              `${valueLists} value lists · profiled ${ago(ctx.generatedAt)}`;
+
+            // Profiling is capped, and a database past the cap is only PARTLY
+            // known — DAVIS will answer confidently about the tables it saw and
+            // has no idea the others exist. That is the most dangerous state
+            // this system can be in, so it is said out loud on every answer
+            // rather than left in a log nobody reads.
+            return ctx.truncated?.length
+              ? `${base} — INCOMPLETE: ${ctx.truncated.join(" ")}`
+              : base;
+          }
         );
-        return (
-          `${ctx.tables.length} tables · ${ctx.foreignKeys.length} join paths · ` +
-          `${valueLists} value lists · profiled ${ago(ctx.generatedAt)}`
-        );
-      }
-    );
-    const schemaDoc = renderSchemaForPrompt(schemaCtx);
+
+    const schemaDoc = schemaCtx ? renderSchemaForPrompt(schemaCtx) : "";
 
     /* ---------------------------------------------------------------------- */
     /* 2. Chat history                                                        */
     /* ---------------------------------------------------------------------- */
-    const chatHistory = await buildChatHistory(sessionId);
+    const chatHistory = await buildChatHistory(session.id, userMessage.id);
 
     /* ---------------------------------------------------------------------- */
     /* 2b. Pre-route — can this skip planning entirely?                       */
@@ -245,6 +335,46 @@ export async function runChatPipeline(args: {
       (d) => `${d.route === "KNOWLEDGE_FAST_PATH" ? "documented knowledge" : "data"} — ${d.reason}`
     );
 
+    // No database connected: there is nothing to plan a query against, so the
+    // knowledge path is not a shortcut here — it is the whole product.
+    if (!conn) {
+      const retrieval =
+        decision.retrieval ??
+        (knowledgeBase
+          ? await retrieve({ question, knowledgeBaseId: knowledgeBase.id })
+          : { sources: [], topScore: 0, empty: true });
+
+      const result = await answerFromKnowledge({
+        question,
+        retrieval,
+        chatHistory,
+        hasDatabase: false,
+        emit,
+        trace,
+      });
+
+      return await persist({
+        question,
+        answer: result.answer,
+        sessionId: session.id,
+        user,
+        connectionId: null,
+        trace,
+        extra: { knowledgeSources: result.sources, abstained: result.abstained },
+        metadata: {
+          status: result.abstained ? "not_documented" : "knowledge_answer",
+          intent: "KNOWLEDGE_QUERY",
+          route: "no_database",
+          knowledgeSources: result.sources,
+          topScore: retrieval.topScore,
+          proseModelUsed: result.modelUsed,
+          plannerSkipped: true,
+          promptVersion: AI_CONFIG.promptVersion,
+          latencyMs: Date.now() - startedAt,
+        },
+      });
+    }
+
     if (decision.route === "KNOWLEDGE_FAST_PATH" && decision.retrieval) {
       const result = await answerFromKnowledge({
         question,
@@ -258,7 +388,7 @@ export async function runChatPipeline(args: {
       return await persist({
         question,
         answer: result.answer,
-        sessionId,
+        sessionId: session.id,
         user,
         connectionId,
         trace,
@@ -287,8 +417,8 @@ export async function runChatPipeline(args: {
     const todayISO = new Date().toISOString().slice(0, 10);
 
     const cacheKey = planCacheKey({
-      connectionId,
-      schemaGeneratedAt: schemaCtx.generatedAt,
+      connectionId: connectionId || "none",
+      schemaGeneratedAt: schemaCtx?.generatedAt || "none",
       question,
       chatHistory,
       // Date literals get baked into the generated SQL, so a plan is only
@@ -367,7 +497,7 @@ export async function runChatPipeline(args: {
       return await persist({
         question,
         answer: result.answer,
-        sessionId,
+        sessionId: session.id,
         user,
         connectionId,
         trace,
@@ -390,6 +520,76 @@ export async function runChatPipeline(args: {
       });
     }
 
+    /* ---------------------------------------------------------------------- */
+    /* The database describing itself                                         */
+    /* ---------------------------------------------------------------------- */
+    // No SQL: the profile was taken when the connection was made and holds row
+    // counts, value lists, date formats and every data-quality warning the
+    // profiler found. Asked what it knew about the database, DAVIS used to
+    // route here as "not data related" and describe its own features while
+    // sitting on all of it.
+    if (plan.intent === "SCHEMA_OVERVIEW") {
+      if (!schemaCtx || !conn) {
+        return await persist({
+          question,
+          answer:
+            "There's no database connected to this conversation, so there's no schema to " +
+            "describe. Pick a connection above and ask again.",
+          sessionId,
+          user,
+          connectionId: connectionId || null,
+          trace,
+          metadata: {
+            status: "no_query",
+            intent: plan.intent,
+            promptVersion: AI_CONFIG.promptVersion,
+            latencyMs: Date.now() - startedAt,
+          },
+        });
+      }
+
+      const summary = buildSchemaSummary(schemaCtx);
+
+      const { answer, meta } = await step(
+        "answer",
+        "Describing the database",
+        () =>
+          generateSchemaOverview({
+            question,
+            factSheet: summary.factSheet,
+            suggestions: summary.suggestions,
+            connectionName: conn.name,
+            chatHistory,
+          }),
+        (r) => `${summary.tableCount} tables · ${summary.totalRows.toLocaleString()} rows · ${r.meta.modelUsed}`
+      );
+
+      return await persist({
+        question,
+        answer,
+        sessionId: session.id,
+        user,
+        connectionId,
+        trace,
+        // The suggestions ride back as clarifying options: they are already
+        // rendered as clickable chips, and a starting question the user can
+        // click is worth more than one they have to retype.
+        extra: { clarifyingOptions: summary.suggestions },
+        metadata: {
+          status: "schema_overview",
+          intent: plan.intent,
+          tableCount: summary.tableCount,
+          totalRows: summary.totalRows,
+          schemaIncomplete: Boolean(schemaCtx.truncated?.length),
+          clarifyingOptions: summary.suggestions,
+          ...modelInfo(),
+          proseModelUsed: meta.modelUsed,
+          promptVersion: AI_CONFIG.promptVersion,
+          latencyMs: Date.now() - startedAt,
+        },
+      });
+    }
+
     if (plan.intent === "NOT_DATA_RELATED") {
       const { answer, meta } = await step(
         "answer",
@@ -405,7 +605,7 @@ export async function runChatPipeline(args: {
       return await persist({
         question,
         answer,
-        sessionId,
+        sessionId: session.id,
         user,
         connectionId,
         trace,
@@ -431,7 +631,7 @@ export async function runChatPipeline(args: {
       return await persist({
         question,
         answer: ask,
-        sessionId,
+        sessionId: session.id,
         user,
         connectionId,
         trace,
@@ -455,7 +655,7 @@ export async function runChatPipeline(args: {
       return await persist({
         question,
         answer,
-        sessionId,
+        sessionId: session.id,
         user,
         connectionId,
         trace,
@@ -557,7 +757,7 @@ export async function runChatPipeline(args: {
             answer:
               plan.clarifyingQuestion ||
               "I couldn't map that question onto the data reliably. Could you rephrase which figure you need?",
-            sessionId,
+            sessionId: session.id,
             user,
             connectionId,
             trace,
@@ -635,7 +835,7 @@ export async function runChatPipeline(args: {
           "I wasn't able to build a query I trust for that question, so I'd rather not " +
           "give you a number I can't stand behind. Could you rephrase it, or tell me which " +
           "specific figures and filters you're after?",
-        sessionId,
+        sessionId: session.id,
         user,
         connectionId,
         trace,
@@ -833,7 +1033,7 @@ export async function runChatPipeline(args: {
     return await persist({
       question,
       answer: composedAnswer,
-      sessionId,
+      sessionId: session.id,
       user,
       connectionId,
       trace,
@@ -879,7 +1079,7 @@ export async function runChatPipeline(args: {
         rateLimiter: rateLimiterStats(),
         hedged: Boolean(planMeta?.hedged || proseMeta?.hedged),
         promptVersion: AI_CONFIG.promptVersion,
-        schemaProfiledAt: schemaCtx.generatedAt,
+        schemaProfiledAt: schemaCtx?.generatedAt ?? null,
         latencyMs: Date.now() - startedAt,
       },
     });
@@ -899,6 +1099,7 @@ export async function runChatPipeline(args: {
         body: {
           error: error.message,
           code: "QUOTA_EXCEEDED",
+          sessionId: resolvedSessionId ?? null,
           quotaExplanation: describeQuota(violation),
           freeTier: Boolean(violation?.freeTier),
           retryAfterMs: error.retryAfterMs ?? null,
@@ -917,6 +1118,7 @@ export async function runChatPipeline(args: {
             "the configured chain can be reached with this API key — check the " +
             "server logs for the list of models the key can actually use.",
           code: "MODEL_CONFIGURATION",
+          sessionId: resolvedSessionId ?? null,
           modelsTried: error.modelsTried,
           trace,
         },
@@ -934,6 +1136,7 @@ export async function runChatPipeline(args: {
             "to think. Raising DAVIS_SQL_CALL_TIMEOUT_MS, or setting " +
             "DAVIS_SQL_THINKING_LEVEL=medium, should fix it.",
           code: "LOCAL_TIMEOUT",
+          sessionId: resolvedSessionId ?? null,
           timeoutMs: error.timeoutMs,
           trace,
         },
@@ -948,6 +1151,7 @@ export async function runChatPipeline(args: {
           error:
             "Google's models are overloaded right now. Nothing is wrong with your question — it's worth trying again in a moment.",
           code: "PROVIDER_OVERLOADED",
+          sessionId: resolvedSessionId ?? null,
           modelsTried: error.modelsTried,
           retryAfterMs: error.retryAfterMs ?? null,
           trace,
@@ -961,6 +1165,7 @@ export async function runChatPipeline(args: {
       body: {
         error: error?.message || "Failed to answer the question",
         code: "INTERNAL_ERROR",
+          sessionId: resolvedSessionId ?? null,
         trace,
       },
     };
@@ -989,11 +1194,18 @@ function mergeAssumptions(previous: QueryPlan, repaired: QueryPlan): QueryPlan {
   };
 }
 
-async function buildChatHistory(sessionId?: string): Promise<string> {
+async function buildChatHistory(
+  sessionId?: string,
+  /** The message just written for this turn — history, not the question. */
+  excludeMessageId?: string
+): Promise<string> {
   if (!sessionId) return "";
 
   const messages = await prisma.chatMessage.findMany({
-    where: { sessionId },
+    where: {
+      sessionId,
+      ...(excludeMessageId ? { id: { not: excludeMessageId } } : {}),
+    },
     orderBy: { createdAt: "desc" },
     take: HISTORY_MESSAGES,
   });
@@ -1029,47 +1241,37 @@ async function buildChatHistory(sessionId?: string): Promise<string> {
 async function persist(args: {
   question: string;
   answer: string;
-  sessionId?: string;
+  /** Always known by this point; the session is created before any work. */
+  sessionId: string;
   user: PipelineUser;
-  connectionId: string;
+  connectionId: string | null;
   trace: TraceEntry[];
   metadata: Record<string, any>;
   extra?: Record<string, any>;
 }): Promise<PipelineOutcome> {
-  const { question, answer, user, connectionId, metadata, extra, trace } = args;
+  const { answer, connectionId, metadata, extra, trace } = args;
 
-  let actualSessionId = args.sessionId;
-  if (!actualSessionId) {
-    const session = await prisma.chatSession.create({
-      data: {
-        title: question.slice(0, 60),
-        userId: user.userId,
-        organizationId: user.organizationId,
-      },
-    });
-    actualSessionId = session.id;
-  }
-
-  await prisma.chatMessage.create({
-    data: {
-      sessionId: actualSessionId,
-      role: "USER",
-      content: question,
-      connectionId,
-    },
-  });
+  // The session and the user's question already exist — they were written
+  // before any of the work that might fail. This only records the answer.
+  const actualSessionId = args.sessionId!;
 
   const assistantMsg = await prisma.chatMessage.create({
     data: {
       sessionId: actualSessionId,
       role: "ASSISTANT",
       content: answer,
-      connectionId,
+      connectionId: connectionId || null,
       // The trace is stored, not just streamed: it survives a reload and
       // doubles as the record of what DAVIS actually did when an answer looks
       // wrong later.
       metadata: JSON.stringify({ ...metadata, trace }),
     },
+  });
+
+  // Touch the conversation so the list sorts by real activity.
+  await prisma.chatSession.update({
+    where: { id: actualSessionId },
+    data: { updatedAt: new Date() },
   });
 
   return {
@@ -1116,7 +1318,7 @@ async function answerFromKnowledge(args: {
     emit({ t: "stage_end", id: "knowledge", detail, ms: 0 });
 
     return {
-      answer: renderNotDocumented({ question }),
+      answer: renderNotDocumented({ question, hasDatabase }),
       sources: [],
       abstained: true,
       modelUsed: "none",

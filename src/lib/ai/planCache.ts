@@ -27,6 +27,15 @@ import type { QueryPlan } from "@/lib/ai/gemini";
  * ============================================================================
  */
 
+/**
+ * NOTE ON WHERE THIS LIVES: in the Node process, not the database.
+ *
+ * That is fine in production, where the process is long-lived and the cache
+ * fills up over a working day. In development it is wiped by every hot reload,
+ * which is why repeated questions never feel cached while you are working on
+ * the app — the cache is not broken, it just never survives long enough to be
+ * hit. Worth knowing before anyone spends an afternoon debugging it.
+ */
 const PLAN_TTL_MS = Number(process.env.DAVIS_PLAN_CACHE_MS || 30 * 60 * 1000);
 const MAX_ENTRIES = Number(process.env.DAVIS_PLAN_CACHE_SIZE || 500);
 

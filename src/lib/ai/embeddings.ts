@@ -32,9 +32,19 @@ import { callWithFallback, parseChain, type CallMeta } from "@/lib/ai/resilience
 const API_KEY = process.env.GEMINI_API_KEY || "";
 const ai = new GoogleGenAI({ apiKey: API_KEY });
 
+/**
+ * gemini-embedding-001 first.
+ *
+ * text-embedding-004 was the head of this chain and 404s on current keys —
+ * "not found for API version v1beta, or is not supported for embedContent".
+ * The fallback works, so nothing broke, but every process paid a failed call
+ * and a disqualification before its first real embedding. A dead model at the
+ * head of a chain is a tax on every cold start, and it is invisible unless
+ * someone reads the log.
+ */
 export const EMBEDDING_CHAIN = parseChain(process.env.DAVIS_EMBEDDING_MODEL_CHAIN, [
-  "text-embedding-004",
   "gemini-embedding-001",
+  "text-embedding-004",
 ]);
 
 export const EMBEDDING_DIMS = 768;

@@ -6,10 +6,12 @@ import {
   buildSqlPrompt,
   PROMPT_VERSION,
   buildKnowledgePrompt,
+  buildSchemaOverviewPrompt,
 } from "@/lib/ai/prompts";
 import type {
   AnswerChartContext,
   KnowledgePromptInput,
+  SchemaOverviewPromptInput,
 } from "@/lib/ai/prompts";
 import {
   callWithFallback,
@@ -122,9 +124,28 @@ function thinkingLevelFromEnv(
   }
 }
 
+/**
+ * MEDIUM, not HIGH.
+ *
+ * HIGH was the original default and the comment above SQL_CALL_TIMEOUT_MS says
+ * what it costs: 20 to 40 seconds for a single plan. That is a defensible price
+ * for an analyst writing a report and an unpayable one for anyone waiting on an
+ * answer — and it is the single largest contributor to this application feeling
+ * slow, because it is paid on every question that is not served from the plan
+ * cache.
+ *
+ * The trade is smaller than it looks. The correctness machinery does not live
+ * in the thinking budget: the dry-run validation, the repair loop, the
+ * deterministic fact sheet and the self-check list all run regardless, and a
+ * plan that comes back wrong is caught and repaired rather than served. What
+ * HIGH buys is fewer repair rounds on genuinely hard questions — worth having
+ * on a hard question, not worth paying for on every easy one.
+ *
+ * Set DAVIS_SQL_THINKING_LEVEL=high to put it back.
+ */
 const SQL_THINKING = thinkingLevelFromEnv(
   process.env.DAVIS_SQL_THINKING_LEVEL,
-  ThinkingLevel.HIGH
+  ThinkingLevel.MEDIUM
 );
 const PROSE_THINKING = thinkingLevelFromEnv(
   process.env.DAVIS_PROSE_THINKING_LEVEL,
@@ -357,6 +378,7 @@ import type { PlannerVisualization } from "@/lib/ai/visualize";
 
 export type QueryIntent =
   | "DATA_QUERY"
+  | "SCHEMA_OVERVIEW"
   | "KNOWLEDGE_QUERY"
   | "HYBRID"
   | "RECALL_PREVIOUS_SQL"
@@ -507,6 +529,7 @@ export function normalisePlan(parsed: any, rawText: string): QueryPlan {
 
   const validIntents: QueryIntent[] = [
     "DATA_QUERY",
+    "SCHEMA_OVERVIEW",
     "KNOWLEDGE_QUERY",
     "HYBRID",
     "RECALL_PREVIOUS_SQL",
@@ -647,6 +670,24 @@ export async function generateKnowledgeAnswer(
     PROSE_MODEL_CHAIN,
     prompt,
     "answer from knowledge"
+  );
+  return { answer: text.trim(), meta };
+}
+
+/**
+ * Describe the connected database from its measured profile.
+ *
+ * Prose chain, not the SQL chain: there is no query to plan and no reasoning to
+ * do — the facts are already assembled, and the job is writing them up.
+ */
+export async function generateSchemaOverview(
+  params: SchemaOverviewPromptInput
+): Promise<{ answer: string; meta: CallMeta }> {
+  const prompt = buildSchemaOverviewPrompt(params);
+  const { text, meta } = await generateText(
+    PROSE_MODEL_CHAIN,
+    prompt,
+    "describe schema"
   );
   return { answer: text.trim(), meta };
 }

@@ -2715,3 +2715,44 @@ a.ks-link:hover { border-color: var(--border-hover); border-left-color: var(--te
 }
 
 .hc-intro strong { color: var(--text-primary); font-weight: 600; }
+
+/* The composer's knowledge-only hint. Positioned in flow rather than absolutely
+   so it cannot overlap the input on a narrow window. */
+.composer-hint {
+  margin-top: var(--space-2);
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* A conversation still generating its answer. Occupies the same slot as the
+   delete control, because a conversation mid-answer is not one to delete. */
+.sess-spinner {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+}
+
+.sess-spinner-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: var(--radius-full);
+  border: 1.5px solid var(--border-default);
+  border-top-color: var(--brand-light);
+  animation: sess-spin 0.7s linear infinite;
+}
+
+@keyframes sess-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Someone who set a long answer running and switched away should not have the
+   motion competing for attention. */
+@media (prefers-reduced-motion: reduce) {
+  .sess-spinner-dot {
+    animation-duration: 2.4s;
+  }
+}

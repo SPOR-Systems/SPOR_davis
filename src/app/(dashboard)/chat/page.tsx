@@ -395,6 +395,49 @@ export default function DataChatPage() {
   /** Bumped after each answer so the conversation list picks up new titles. */
   const [sessionsToken, setSessionsToken] = useState(0);
 
+  /**
+   * Mirrors of state that a long-running request needs to read when it
+   * finishes. `send` closes over the values from when it started, which by then
+   * can be twenty seconds stale.
+   */
+  const sessionIdRef = useRef<string | null>(null);
+  const openSessionRef = useRef<((id: string) => Promise<void>) | null>(null);
+
+  /**
+   * Which request the screen is currently waiting for.
+   *
+   * A streamed answer takes tens of seconds, and nothing stopped the user
+   * starting a new conversation in the middle of one. When the old answer
+   * arrived it was appended to whatever was on screen — so it landed in the new
+   * chat, under a question that was never asked. The stream carries no session
+   * identity of its own, so the client has to hold it: every send takes a
+   * ticket, and a result whose ticket is stale is dropped.
+   */
+  const ticketRef = useRef(0);
+
+  /**
+   * Conversations with an answer still being generated.
+   *
+   * Switching away no longer cancels the work. Aborting looked tidy and was
+   * wrong: the server keeps going regardless once the request is in flight, so
+   * cancelling the client only threw away the answer to a question the user had
+   * already asked and paid for. Now the request runs to completion, the answer
+   * lands in its own conversation, and this set is what tells the user which
+   * conversation is still thinking.
+   */
+  const [working, setWorking] = useState<string[]>([]);
+
+  /**
+   * Stop rendering whatever is in flight into the current view.
+   *
+   * The work continues; only the screen moves on.
+   */
+  const detachFromInFlight = useCallback(() => {
+    ticketRef.current += 1;
+    setIsLoading(false);
+    setLiveTrace([]);
+  }, []);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Fetch connections on load
@@ -408,6 +451,8 @@ export default function DataChatPage() {
             setSelectedDb(data.connections[0].id);
           }
         }
+        // With no connections the selector stays on "Knowledge base only",
+        // which is now a working mode rather than a dead end.
       });
   }, []);
 
@@ -418,7 +463,9 @@ export default function DataChatPage() {
 
   const send = useCallback(
     async (question: string, opts: { echoUser?: boolean } = {}) => {
-      if (!question.trim() || !selectedDb || isLoading) return;
+      // No database is a valid state: an organisation may have documents and no
+      // connection at all, and the knowledge path never needed one.
+      if (!question.trim() || isLoading) return;
 
       if (opts.echoUser !== false) {
         setMessages(prev => [
@@ -430,6 +477,12 @@ export default function DataChatPage() {
       setLastQuestion(question);
       setIsLoading(true);
 
+      const ticket = ++ticketRef.current;
+      /** True while this request is still the one the screen is waiting for. */
+      const current = () => ticketRef.current === ticket;
+      /** Set from the session event; the request may outlive the view. */
+      let liveSessionId: string | null = sessionId;
+
       setLiveTrace([]);
       const requestStartedAt = Date.now();
       // Collected from the stream so the finished message can keep the trace.
@@ -437,6 +490,8 @@ export default function DataChatPage() {
 
       /** Turn a final payload into a chat message. Shared by ok and error. */
       const settle = (status: number, data: any) => {
+        // The user moved on. Their new conversation must not inherit this.
+        if (!current()) return;
         const elapsed = Date.now() - requestStartedAt;
         const trace: TraceEntry[] =
           (Array.isArray(data?.trace) && data.trace.length
@@ -507,6 +562,20 @@ export default function DataChatPage() {
       };
 
       const apply = (evt: any) => {
+        // The session event is handled whether or not the user is still looking:
+        // a conversation that exists must appear in the list and be markable as
+        // working, even if they have already moved on from it.
+        if (evt.t === "session") {
+          liveSessionId = evt.sessionId;
+          setWorking((prev) =>
+            prev.includes(evt.sessionId) ? prev : [...prev, evt.sessionId]
+          );
+          setSessionsToken((n) => n + 1);
+          if (current()) setSessionId(evt.sessionId);
+          return;
+        }
+
+        if (!current()) return;
         if (evt.t === "stage") {
           collected.push({ id: evt.id, label: evt.label, ms: 0, running: true });
           setLiveTrace([...collected]);
@@ -536,7 +605,9 @@ export default function DataChatPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             question,
-            connectionId: selectedDb,
+            // Empty means knowledge-base only: no database is selected, so
+            // there is nothing to query and only documents can answer.
+            connectionId: selectedDb || null,
             sessionId,
             stream: true,
           }),
@@ -584,7 +655,8 @@ export default function DataChatPage() {
             /* nothing usable in the tail */
           }
         }
-      } catch (err) {
+      } catch {
+        if (!current()) return;
         setMessages(prev => [
           ...prev,
           {
@@ -596,9 +668,21 @@ export default function DataChatPage() {
           },
         ]);
       } finally {
-        setIsLoading(false);
-        setLiveTrace([]);
+        if (liveSessionId) {
+          const finished = liveSessionId;
+          setWorking((prev) => prev.filter((id) => id !== finished));
+          // If the user wandered off and came back while this was running, the
+          // view is showing the conversation without its answer. Reload it now
+          // that there is one, rather than leaving a question hanging.
+          if (!current() && sessionIdRef.current === finished) {
+            void openSessionRef.current?.(finished);
+          }
+        }
         setSessionsToken((n) => n + 1);
+        if (current()) {
+          setIsLoading(false);
+          setLiveTrace([]);
+        }
       }
     },
     [selectedDb, isLoading, sessionId]
@@ -612,6 +696,7 @@ export default function DataChatPage() {
    * of what this application is for.
    */
   const openSession = useCallback(async (id: string) => {
+    detachFromInFlight();
     try {
       const res = await fetch(`/api/chat/sessions/${id}`);
       if (!res.ok) return;
@@ -636,13 +721,22 @@ export default function DataChatPage() {
     } catch {
       /* leave the current conversation alone if it cannot be loaded */
     }
-  }, []);
+  }, [detachFromInFlight]);
+
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
 
   const startNewSession = useCallback(() => {
+    detachFromInFlight();
     setSessionId(null);
     setMessages([]);
     setLastQuestion("");
-  }, []);
+  }, [detachFromInFlight]);
+
+  useEffect(() => {
+    openSessionRef.current = openSession;
+  }, [openSession]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -665,6 +759,7 @@ export default function DataChatPage() {
     <div className="chat-shell">
       <SessionList
         activeId={sessionId}
+        working={working}
         onOpen={(id) => void openSession(id)}
         onNew={startNewSession}
         reloadToken={sessionsToken}
@@ -687,13 +782,13 @@ export default function DataChatPage() {
             onChange={e => setSelectedDb(e.target.value)}
             disabled={isLoading || connections.length === 0}
           >
-            {connections.length === 0 ? (
-              <option value="">No connections found</option>
-            ) : (
-              connections.map(db => (
-                <option key={db.id} value={db.id}>{db.name} ({db.type})</option>
-              ))
-            )}
+            {/* Deliberately a real choice rather than a disabled state: asking
+                the knowledge base is a first-class use of this app, not a
+                degraded version of asking the database. */}
+            <option value="">Knowledge base only</option>
+            {connections.map(db => (
+              <option key={db.id} value={db.id}>{db.name} ({db.type})</option>
+            ))}
           </select>
         </div>
       </div>
@@ -873,12 +968,12 @@ export default function DataChatPage() {
             placeholder="Ask DAVIS"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            disabled={isLoading || !selectedDb}
+            disabled={isLoading}
           />
           <button
             type="submit"
             className="w-10 h-10 rounded-lg bg-brand-primary text-white flex items-center justify-center hover:bg-brand-primary/90 disabled:opacity-50 transition-all shrink-0 shadow-sm"
-            disabled={isLoading || !input.trim() || !selectedDb}
+            disabled={isLoading || !input.trim()}
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <line x1="22" y1="2" x2="11" y2="13" />
@@ -886,8 +981,10 @@ export default function DataChatPage() {
             </svg>
           </button>
         </div>
-        {!selectedDb && connections.length > 0 && (
-          <p className="absolute -top-6 left-2 text-xs text-warning">Please select a database connection first.</p>
+        {!selectedDb && (
+          <p className="composer-hint">
+            No database selected — DAVIS will answer from your knowledge base only.
+          </p>
         )}
       </form>
     </div>

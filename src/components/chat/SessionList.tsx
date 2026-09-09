@@ -37,13 +37,32 @@ function when(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
+/** Deliberately in place of the delete control: you cannot delete mid-answer. */
+function Spinner() {
+  return (
+    <span className="sess-spinner" role="status" aria-label="Generating an answer">
+      <span className="sess-spinner-dot" />
+    </span>
+  );
+}
+
 export default function SessionList({
   activeId,
+  working,
   onOpen,
   onNew,
   reloadToken,
 }: {
   activeId: string | null;
+  /**
+   * Conversations still generating an answer.
+   *
+   * Without this the list gives no way to tell a finished conversation from one
+   * that is mid-answer — and since a request now survives switching away, that
+   * distinction is the difference between "my question vanished" and "it is
+   * still thinking, over there".
+   */
+  working: string[];
   onOpen: (id: string) => void;
   onNew: () => void;
   /** Bumped by the parent after a message is sent, so titles stay current. */
@@ -91,6 +110,11 @@ export default function SessionList({
     }
   };
 
+  // A conversation created moments ago may not be in the fetched list yet. It
+  // still needs a row, or the user watches their brand-new chat not appear.
+  const known = new Set(sessions.map((s) => s.id));
+  const pending = working.filter((id) => !known.has(id));
+
   return (
     <aside className={open ? "sess" : "sess sess-collapsed"}>
       <div className="sess-head">
@@ -115,7 +139,17 @@ export default function SessionList({
 
       {open && (
         <ul className="sess-list">
-          {sessions.length === 0 ? (
+          {pending.map((id) => (
+            <li key={id} className={id === activeId ? "sess-item is-active" : "sess-item"}>
+              <button type="button" className="sess-open" onClick={() => onOpen(id)}>
+                <span className="sess-item-title">New conversation</span>
+                <span className="sess-item-meta">Thinking…</span>
+              </button>
+              <Spinner />
+            </li>
+          ))}
+
+          {sessions.length === 0 && pending.length === 0 ? (
             <li className="sess-empty">No conversations yet.</li>
           ) : (
             sessions.map((session) => (
@@ -160,15 +194,19 @@ export default function SessionList({
                         {session.messageCount === 1 ? "" : "s"}
                       </span>
                     </button>
-                    <button
-                      type="button"
-                      className="sess-remove"
-                      onClick={() => setArmed(session.id)}
-                      aria-label={`Delete conversation: ${session.title}`}
-                      title="Delete conversation"
-                    >
-                      ×
-                    </button>
+                    {working.includes(session.id) ? (
+                      <Spinner />
+                    ) : (
+                      <button
+                        type="button"
+                        className="sess-remove"
+                        onClick={() => setArmed(session.id)}
+                        aria-label={`Delete conversation: ${session.title}`}
+                        title="Delete conversation"
+                      >
+                        ×
+                      </button>
+                    )}
                   </>
                 )}
               </li>
