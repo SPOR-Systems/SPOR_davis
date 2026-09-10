@@ -13,7 +13,14 @@ export default function RegisterPage() {
     password: "",
   });
   const [error, setError] = useState("");
+  const [sent, setSent] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  /**
+   * "create" makes a new organization. "join" asks an existing one to let you
+   * in, and creates nothing until someone there approves — so a stranger who
+   * guesses an organization's name does not end up inside it.
+   */
+  const [mode, setMode] = useState<"create" | "join">("create");
   
   const router = useRouter();
   const { login } = useAuth();
@@ -37,14 +44,17 @@ export default function RegisterPage() {
       const res = await fetch("/api/auth/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(formData),
+        body: JSON.stringify({ ...formData, mode }),
       });
 
       const data = await res.json();
 
-      if (res.ok) {
+      if (res.status === 202 && data.pending) {
+        // Joining: there is no account yet and nothing to sign in to.
+        setSent(data.message);
+      } else if (res.ok) {
         login(data.token, data.user, data.organization);
-        router.push("/dashboard"); // We'll create this later
+        router.push("/dashboard");
       } else {
         setError(data.error || "Failed to register");
       }
@@ -58,11 +68,38 @@ export default function RegisterPage() {
   return (
     <div className="auth-card animate-fade-in-up" style={{ animationDelay: "0.1s" }}>
       <div className="flex flex-col items-center mb-6">
-        <h1 className="text-2xl font-bold mb-2">Create Workspace</h1>
+        <h1 className="text-2xl font-bold mb-2">
+          {mode === "create" ? "Create a workspace" : "Join a workspace"}
+        </h1>
         <p className="text-secondary text-sm text-center">
-          Set up a new DAVIS intelligence workspace for your organization.
+          {mode === "create"
+            ? "Set up DAVIS for your organization. You'll be its administrator."
+            : "Ask to join an organization that already uses DAVIS."}
         </p>
       </div>
+
+      <div className="adm-tabs" style={{ marginBottom: "var(--space-5)" }}>
+        <button
+          type="button"
+          className={`adm-tab ${mode === "create" ? "adm-tab-active" : ""}`}
+          onClick={() => { setMode("create"); setError(""); }}
+        >
+          New organization
+        </button>
+        <button
+          type="button"
+          className={`adm-tab ${mode === "join" ? "adm-tab-active" : ""}`}
+          onClick={() => { setMode("join"); setError(""); }}
+        >
+          Join an existing one
+        </button>
+      </div>
+
+      {sent && (
+        <div className="adm-notice adm-notice-ok">
+          {sent}
+        </div>
+      )}
 
       <form onSubmit={handleSubmit} className="flex flex-col gap-4">
         {error && (
@@ -72,7 +109,9 @@ export default function RegisterPage() {
         )}
 
         <div>
-          <label className="label" htmlFor="organizationName">Organization Name</label>
+          <label className="label" htmlFor="organizationName">
+            {mode === "create" ? "Organization name" : "Which organization?"}
+          </label>
           <input
             id="organizationName"
             name="organizationName"
@@ -83,6 +122,12 @@ export default function RegisterPage() {
             onChange={handleChange}
             required
           />
+          {mode === "join" && (
+            <p className="adm-field-hint">
+              Type its name exactly as it was set up. Someone there will need to
+              approve you before you can sign in.
+            </p>
+          )}
         </div>
 
         <div>

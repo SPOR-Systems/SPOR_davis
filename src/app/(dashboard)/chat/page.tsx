@@ -1,13 +1,14 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { DatabaseConnection } from "@/components/connections/AddConnectionModal";
 
 import dynamic from "next/dynamic";
 import type { ChartPayload } from "@/lib/ai/visualize";
 import KnowledgeSources, {
   type KnowledgeSource,
 } from "@/components/chat/KnowledgeSources";
+import SourcePicker, { ChatSource } from "@/components/chat/SourcePicker";
+import { useAuth } from "@/lib/auth/context";
 import SessionList from "@/components/chat/SessionList";
 
 /**
@@ -382,8 +383,12 @@ function ExportBar({
 }
 
 export default function DataChatPage() {
-  const [connections, setConnections] = useState<DatabaseConnection[]>([]);
   const [selectedDb, setSelectedDb] = useState<string>("");
+  /**
+   * What the next question is about. One value, so the tenant and the database
+   * can never disagree — which is exactly what two dropdowns allowed.
+   */
+  const [source, setSource] = useState<ChatSource | null>(null);
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -439,22 +444,10 @@ export default function DataChatPage() {
   }, []);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const { user } = useAuth();
+  const isAdmin = user?.role === "ADMIN";
 
-  // Fetch connections on load
-  useEffect(() => {
-    fetch("/api/connections")
-      .then(res => res.json())
-      .then(data => {
-        if (data.connections) {
-          setConnections(data.connections);
-          if (data.connections.length > 0) {
-            setSelectedDb(data.connections[0].id);
-          }
-        }
-        // With no connections the selector stays on "Knowledge base only",
-        // which is now a working mode rather than a dead end.
-      });
-  }, []);
+
 
   // Auto-scroll
   useEffect(() => {
@@ -608,6 +601,11 @@ export default function DataChatPage() {
             // Empty means knowledge-base only: no database is selected, so
             // there is nothing to query and only documents can answer.
             connectionId: selectedDb || null,
+            // Sent only when a tenant was actually chosen. The server
+            // authorizes it against the signed-in user's grants before any
+            // connection opens — naming a tenant here is a request, not a
+            // claim.
+            tenantKey: source?.tenantKey || undefined,
             sessionId,
             stream: true,
           }),
@@ -734,6 +732,30 @@ export default function DataChatPage() {
     setLastQuestion("");
   }, [detachFromInFlight]);
 
+  /**
+   * Switching tenant starts a new conversation.
+   *
+   * A session is pinned to the tenant it began against, and the server refuses
+   * a question whose tenant does not match its conversation. Carrying the old
+   * thread across would put one tenant's questions in another's history, and
+   * per-tenant retention would stop meaning anything.
+   */
+  const onSourceChange = useCallback(
+    (next: ChatSource) => {
+      setSource((current) => {
+        const same =
+          current?.kind === next.kind &&
+          current?.tenantId === next.tenantId &&
+          current?.connectionId === next.connectionId;
+        if (current && !same) startNewSession();
+        return next;
+      });
+      // Both halves move together. There is no way to set one without the other.
+      setSelectedDb(next.connectionId || "");
+    },
+    [startNewSession]
+  );
+
   useEffect(() => {
     openSessionRef.current = openSession;
   }, [openSession]);
@@ -774,22 +796,22 @@ export default function DataChatPage() {
           <p className="text-sm text-text-secondary">Get answers powered by your data.</p>
         </div>
 
-        <div className="flex items-center gap-3">
-          <label className="text-sm font-medium text-text-muted">Target DB:</label>
-          <select
-            className="input max-w-[200px] py-2 text-sm bg-bg-elevated border-border-subtle"
-            value={selectedDb}
-            onChange={e => setSelectedDb(e.target.value)}
-            disabled={isLoading || connections.length === 0}
-          >
-            {/* Deliberately a real choice rather than a disabled state: asking
-                the knowledge base is a first-class use of this app, not a
-                degraded version of asking the database. */}
-            <option value="">Knowledge base only</option>
-            {connections.map(db => (
-              <option key={db.id} value={db.id}>{db.name} ({db.type})</option>
-            ))}
-          </select>
+        <div className="chat-bar-controls">
+          {/* One control. A tenant is a database, so choosing the tenant has
+              already chosen the database — a second dropdown could only ever
+              be used to make the two disagree. */}
+          <SourcePicker
+            value={source}
+            onChange={onSourceChange}
+            isAdmin={isAdmin}
+            disabled={isLoading}
+          />
+
+          {source?.kind === "tenant" && !source.connectionId && (
+            <span className="chat-bar-label">
+              No database linked — answering from documents
+            </span>
+          )}
         </div>
       </div>
 

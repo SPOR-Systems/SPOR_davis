@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { requireAuth } from "@/lib/auth";
 import { encryptText } from "@/lib/encryption";
+import { accessibleConnectionIds } from "@/lib/embed/access";
 
 export async function GET(request: NextRequest) {
   try {
@@ -13,8 +14,28 @@ export async function GET(request: NextRequest) {
     
     const { user } = authResult;
 
+    // Database connections are an ADMIN surface. They carry hosts, ports and
+    // usernames — the shape of the customer's infrastructure — and an ordinary
+    // member has no reason to see any of it. What a member needs is their own
+    // tenant, which /api/tenants/accessible gives them without any of this.
+    if (user.role !== "ADMIN") {
+      return NextResponse.json(
+        { error: "Forbidden. Admin access required.", code: "FORBIDDEN" },
+        { status: 403 }
+      );
+    }
+
+    // Only the databases this person's tenant access reaches. A member granted
+    // one clinic should not be offered every other clinic in the dropdown —
+    // and the question path enforces the same rule, so this is presentation
+    // rather than protection.
+    const allowed = await accessibleConnectionIds(user.userId, user.organizationId);
+
     const connections = await prisma.databaseConnection.findMany({
-      where: { organizationId: user.organizationId },
+      where: {
+        organizationId: user.organizationId,
+        ...(allowed === null ? {} : { id: { in: allowed } }),
+      },
       select: {
         id: true,
         name: true,

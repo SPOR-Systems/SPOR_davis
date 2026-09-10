@@ -2,7 +2,8 @@
 
 import { useAuth } from "@/lib/auth/context";
 import { useRouter, usePathname } from "next/navigation";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { prefetchDashboard } from "@/lib/clientCache";
 import Link from "next/link";
 import Image from "next/image";
 
@@ -37,6 +38,23 @@ const DocumentIcon = () => (
   </svg>
 );
 
+const BuildingIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="4" y="2" width="16" height="20" rx="2" />
+    <path d="M9 22v-4h6v4" />
+    <path d="M8 6h.01" /><path d="M16 6h.01" />
+    <path d="M8 10h.01" /><path d="M16 10h.01" />
+    <path d="M8 14h.01" /><path d="M16 14h.01" />
+  </svg>
+);
+
+const GaugeIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 20a8 8 0 1 1 8-8" />
+    <path d="m12 12 4-4" />
+  </svg>
+);
+
 const SettingsIcon = () => (
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     <circle cx="12" cy="12" r="3" />
@@ -52,12 +70,22 @@ const LogOutIcon = () => (
   </svg>
 );
 
+/**
+ * `adminOnly` items are hidden from ordinary members — and the endpoints behind
+ * them refuse a member too, so this is tidiness rather than the protection.
+ *
+ * A member's job here is to ask questions about their own tenant. Database
+ * hosts, API keys, billing and other people's access are not their business,
+ * and a page they can see but never use is just a locked door in the hallway.
+ */
 const navItems = [
   { name: "Overview", href: "/dashboard", icon: <DashboardIcon /> },
   { name: "Data Chat", href: "/chat", icon: <ChatIcon /> },
-  { name: "Connections", href: "/connections", icon: <DatabaseIcon /> },
   { name: "Knowledge Base", href: "/knowledge", icon: <DocumentIcon /> },
-  { name: "Settings", href: "/settings", icon: <SettingsIcon /> },
+  { name: "Connections", href: "/connections", icon: <DatabaseIcon />, adminOnly: true },
+  { name: "Tenants", href: "/tenants", icon: <BuildingIcon />, adminOnly: true },
+  { name: "Usage", href: "/usage", icon: <GaugeIcon />, adminOnly: true },
+  { name: "Settings", href: "/settings", icon: <SettingsIcon />, adminOnly: true },
 ];
 
 export default function DashboardLayout({
@@ -74,6 +102,54 @@ export default function DashboardLayout({
       router.push("/login");
     }
   }, [isLoading, isAuthenticated, router]);
+
+  // Once signed in and the current page has settled, quietly fetch what the
+  // other tabs will need. The knowledge base in particular used to make people
+  // wait through three requests every time they opened it, for data that had
+  // usually not changed since the last time they looked.
+  useEffect(() => {
+    if (isAuthenticated) prefetchDashboard(user?.role === "ADMIN");
+  }, [isAuthenticated]);
+
+  /**
+   * A member who types /tenants into the address bar goes back to the chat.
+   *
+   * The endpoints already refuse them, so without this they would land on a
+   * page that renders empty tables and unexplained errors — which reads as the
+   * app being broken rather than as a door that was never theirs.
+   */
+  useEffect(() => {
+    if (isLoading || !isAuthenticated || user?.role === "ADMIN") return;
+    const adminPaths = navItems.filter((i) => i.adminOnly).map((i) => i.href);
+    if (adminPaths.some((p) => pathname === p || pathname.startsWith(`${p}/`))) {
+      router.replace("/chat");
+    }
+  }, [isLoading, isAuthenticated, user?.role, pathname, router]);
+
+  /**
+   * Someone waiting to join shows on the Settings item itself.
+   *
+   * The count inside Settings only helps a person already looking at Settings,
+   * and nobody opens that page speculatively — so a request could sit unseen
+   * for days. Re-checked on navigation and every couple of minutes, which is as
+   * fresh as this needs to be.
+   */
+  const [pendingJoins, setPendingJoins] = useState(0);
+  useEffect(() => {
+    if (!isAuthenticated || user?.role !== "ADMIN") return;
+    let alive = true;
+    const check = () =>
+      fetch("/api/registrations")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => alive && d && setPendingJoins(d.pendingCount || 0))
+        .catch(() => {});
+    check();
+    const id = setInterval(check, 120_000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [isAuthenticated, user?.role, pathname]);
 
   if (isLoading || !isAuthenticated) {
     return (
@@ -106,7 +182,9 @@ export default function DashboardLayout({
 
         {/* Navigation */}
         <nav className="flex-1 overflow-y-auto py-6 px-4">
-          {navItems.map((item) => {
+          {navItems
+            .filter((item) => !item.adminOnly || user?.role === "ADMIN")
+            .map((item) => {
             const isActive = pathname === item.href || pathname.startsWith(`${item.href}/`);
             return (
               <Link
@@ -118,6 +196,11 @@ export default function DashboardLayout({
                   {item.icon}
                 </span>
                 {item.name}
+                {item.href === "/settings" && pendingJoins > 0 && (
+                  <span className="nav-badge" title={`${pendingJoins} waiting to join`}>
+                    {pendingJoins}
+                  </span>
+                )}
               </Link>
             );
           })}

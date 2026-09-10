@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import Link from "next/link";
 import AddConnectionModal, { DatabaseConnection } from "@/components/connections/AddConnectionModal";
 
 export default function ConnectionsPage() {
@@ -178,6 +179,12 @@ export default function ConnectionsPage() {
                       answers keep their figures — so the confirmation says
                       exactly that rather than a generic "are you sure". */}
                   <div className="conn-actions">
+                    {/* Scoping is per connection, and a connection that is scoped
+                        but unverified will not answer at all — so the way in has
+                        to be visible from the list rather than buried. */}
+                    <Link href={`/connections/${conn.id}/scope`} className="kb-secondary">
+                      Data separation
+                    </Link>
                     {armed === conn.id ? (
                       <span className="kb-confirm">
                         <span className="kb-confirm-text">

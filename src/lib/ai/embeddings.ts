@@ -1,5 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import { callWithFallback, parseChain, type CallMeta } from "@/lib/ai/resilience";
+import { countProviderCall } from "@/lib/embed/meter";
 
 /**
  * ============================================================================
@@ -140,6 +141,10 @@ async function embedBatch(
           abortSignal: ctx.signal,
         },
       });
+
+      // Embedding calls cost money too, and a document ingest is many of them.
+      // Leaving them off the meter would make ingestion look free.
+      countProviderCall({ input: response.metadata?.billableCharacterCount });
 
       const embeddings = response.embeddings;
       if (!embeddings || embeddings.length !== texts.length) {

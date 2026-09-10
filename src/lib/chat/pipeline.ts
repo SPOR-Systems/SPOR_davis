@@ -24,10 +24,21 @@ import { getCachedPlan, planCacheKey, setCachedPlan } from "@/lib/ai/planCache";
 import {
   countRows,
   executeQuery,
+  resolveQueryTarget,
   validateQuery,
   type QueryResult,
 } from "@/lib/db/queryRunner";
 import { getSchemaContext, renderSchemaForPrompt } from "@/lib/db/schemaContext";
+import { ScopeError } from "@/lib/db/scope";
+import { withMeter } from "@/lib/embed/meter";
+import {
+  TenantAccessError,
+  assertConnectionAllowed,
+  assertTenantOwnsConnection,
+  authorizeTenant,
+  soleTenantOfConnection,
+} from "@/lib/embed/access";
+import { recordUsage } from "@/lib/embed/usage";
 import {
   buildDataPreview,
   buildFactSheet,
@@ -146,10 +157,70 @@ function ago(iso: string): string {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
+/**
+ * The metered entry point.
+ *
+ * Everything the question costs is counted inside `withMeter` and written once,
+ * at the end, against the TENANT — never the key. An integrator who consolidates
+ * 4,000 tenant keys into one org key has changed their credential management,
+ * not their usage, and their invoice must not move.
+ *
+ * A standalone dashboard question resolves no tenant, so nothing is written and
+ * no branch is needed to say so.
+ */
 export async function runChatPipeline(args: {
   user: PipelineUser;
   body: any;
   emit?: Emit;
+  tenantKey?: string | null;
+  requireScope?: boolean;
+}): Promise<PipelineOutcome> {
+  let billable: { organizationId: string; tenantId: string } | null = null;
+
+  const { value, spent } = await withMeter(() =>
+    runPipelineBody({
+      ...args,
+      onTenantResolved: (b) => {
+        billable = b;
+      },
+    })
+  );
+
+  if (billable) {
+    const { organizationId, tenantId } = billable as {
+      organizationId: string;
+      tenantId: string;
+    };
+    // Awaited, but recordUsage never throws: an invoice being slightly light is
+    // a smaller problem than an answer dying because a counter row was locked.
+    await recordUsage(organizationId, tenantId, {
+      questions: value.status < 400 ? 1 : 0,
+      refusals: value.status >= 400 ? 1 : 0,
+      providerCalls: spent.providerCalls,
+      inputTokens: spent.inputTokens,
+      outputTokens: spent.outputTokens,
+    });
+  }
+
+  return value;
+}
+
+async function runPipelineBody(args: {
+  user: PipelineUser;
+  body: any;
+  emit?: Emit;
+  /** Called once the question is known to belong to a billable tenant. */
+  onTenantResolved?: (b: { organizationId: string; tenantId: string }) => void;
+  /**
+   * Who is asking, for a scoped connection. Set by the embedded endpoint from
+   * the API key; null for the standalone dashboard.
+   */
+  tenantKey?: string | null;
+  /**
+   * True for embedded requests. An embedded request against an unscoped
+   * connection is REFUSED rather than answered from every tenant's rows.
+   */
+  requireScope?: boolean;
 }): Promise<PipelineOutcome> {
   const { user, body } = args;
   const startedAt = Date.now();
@@ -214,6 +285,108 @@ export async function runChatPipeline(args: {
     //
     // Writing it first costs one insert and makes the question survive whatever
     // happens next.
+    // Which tenant is this question about?
+    //
+    // An embedded request has it pinned by its token and the caller cannot
+    // choose. A dashboard request MAY name one — that is cross-tenant access —
+    // and naming one is exactly where authorization has to happen: before any
+    // connection is opened, before resolveScope, before anything reads a row.
+    //
+    // Note what is NOT here: no set, no list, no merging. Switching is per
+    // question, so a master reading Store B gets byte-for-byte the surface
+    // Store B's own staff get, on the same code path.
+    const conn = connectionId
+      ? await prisma.databaseConnection.findFirst({
+          where: { id: connectionId, organizationId: user.organizationId },
+        })
+      : null;
+
+    if (connectionId && !conn) {
+      return {
+        status: 404,
+        body: { error: "Database connection not found", code: "NO_CONNECTION" },
+      };
+    }
+
+    let requestedTenantKey =
+      args.tenantKey ??
+      (typeof body?.tenantKey === "string" && body.tenantKey.trim()
+        ? body.tenantKey.trim()
+        : null);
+
+    /* ---------------------------------------------------------------------- */
+    /* MAY THIS PERSON QUERY THIS DATABASE?                                   */
+    /* ---------------------------------------------------------------------- */
+    // A tenant is a database. Being granted Clinic A means reaching Clinic A's
+    // database and no other, so the check happens here — on the path a question
+    // actually takes — and not only where the dropdown is filled in. A filtered
+    // dropdown stops an honest mistake; this stops a request.
+    if (conn && !args.tenantKey) {
+      try {
+        await assertConnectionAllowed(user.userId, user.organizationId, conn.id);
+      } catch (error) {
+        if (error instanceof TenantAccessError) {
+          return {
+            status: error.status,
+            body: { error: error.message, code: error.code },
+          };
+        }
+        throw error;
+      }
+
+      // With one database per tenant, picking the database has already picked
+      // the tenant. Making someone choose it again in a second dropdown is
+      // asking them to repeat themselves — and is one more place to get it
+      // wrong. A SHARED database still needs the tenant named, because there
+      // the question genuinely is ambiguous.
+      if (!requestedTenantKey) {
+        const sole = await soleTenantOfConnection(user.organizationId, conn.id);
+        if (sole) requestedTenantKey = sole.externalKey;
+      }
+    }
+
+
+    let openingTenant: { id: string } | null = null;
+    if (requestedTenantKey) {
+      if (args.tenantKey) {
+        // Pinned by an embed token: the tenant was authorized when the token
+        // was minted, and the widget never got to choose.
+        const pinned = await prisma.tenant.findFirst({
+          where: { organizationId: user.organizationId, externalKey: args.tenantKey },
+          select: { id: true },
+        });
+        if (!pinned) {
+          return { status: 404, body: { error: "Unknown tenant.", code: "NO_TENANT" } };
+        }
+        openingTenant = pinned;
+      } else {
+        try {
+          openingTenant = await authorizeTenant(
+            user.userId,
+            user.organizationId,
+            requestedTenantKey
+          );
+          // Naming a tenant is naming its database. Saying one and querying the
+          // other is refused here rather than resolved silently.
+          if (conn) {
+            await assertTenantOwnsConnection(
+              user.organizationId,
+              openingTenant.id,
+              conn.id
+            );
+          }
+        } catch (error) {
+          if (error instanceof TenantAccessError) {
+            return {
+              status: error.status,
+              body: { error: error.message, code: error.code },
+            };
+          }
+          throw error;
+        }
+      }
+    }
+
     const session = sessionId
       ? await prisma.chatSession.findFirst({
           where: { id: sessionId, userId: user.userId, organizationId: user.organizationId },
@@ -223,6 +396,11 @@ export async function runChatPipeline(args: {
             title: question.slice(0, 60),
             userId: user.userId,
             organizationId: user.organizationId,
+            tenantId: openingTenant?.id ?? null,
+            endUserId:
+              typeof body?.endUserId === "string" && body.endUserId.trim()
+                ? body.endUserId.trim().slice(0, 200)
+                : null,
           },
         });
 
@@ -253,20 +431,100 @@ export async function runChatPipeline(args: {
     // knowledge path was always independent of the database; requiring a
     // connection to reach it was an accident of the original chat page, and it
     // made the product unusable for anyone without a database to point at.
-    const conn = connectionId
-      ? await prisma.databaseConnection.findFirst({
-          where: { id: connectionId, organizationId: user.organizationId },
-        })
-      : null;
+    const dialect = conn ? dialectLabel(conn.type) : "";
 
-    if (connectionId && !conn) {
-      return {
-        status: 404,
-        body: { error: "Database connection not found", code: "NO_CONNECTION" },
-      };
+    /* ---------------------------------------------------------------------- */
+    /* WHO IS ASKING                                                          */
+    /* ---------------------------------------------------------------------- */
+    // Resolved once, here, and carried to every function that touches the
+    // customer database. Nothing downstream can run a query without it — the
+    // signatures do not allow it.
+    //
+    // A conversation that belongs to a tenant is pinned to that tenant for the
+    // rest of its life. If the caller supplies a different key, that is either
+    // a bug or an attempt, and either way the honest response is to refuse
+    // rather than to answer using the key that happens to be more convenient.
+    let tenantKey = requestedTenantKey;
+    if (session.tenantId) {
+      const owner = await prisma.tenant.findUnique({
+        where: { id: session.tenantId },
+        select: { externalKey: true },
+      });
+      if (!owner) {
+        return {
+          status: 404,
+          body: {
+            error: "This conversation belongs to a tenant that no longer exists.",
+            code: "NO_TENANT",
+            sessionId: session.id,
+          },
+        };
+      }
+      if (tenantKey && tenantKey !== owner.externalKey) {
+        return {
+          status: 403,
+          body: {
+            error: "This conversation belongs to a different tenant.",
+            code: "TENANT_MISMATCH",
+            sessionId: session.id,
+          },
+        };
+      }
+      tenantKey = owner.externalKey;
+
+      // The conversation's tenant and the database being queried have to agree.
+      // Without this, a session pinned to one tenant could be re-pointed at
+      // another database by changing the dropdown.
+      if (conn) {
+        try {
+          await assertTenantOwnsConnection(user.organizationId, session.tenantId, conn.id);
+        } catch (error) {
+          if (error instanceof TenantAccessError) {
+            return {
+              status: error.status,
+              body: { error: error.message, code: error.code, sessionId: session.id },
+            };
+          }
+          throw error;
+        }
+      }
+      // Reported here rather than only alongside a database target: a knowledge
+      // question needs no connection, and an unmetered path is a free path.
+      args.onTenantResolved?.({
+        organizationId: user.organizationId,
+        tenantId: session.tenantId,
+      });
     }
 
-    const dialect = conn ? dialectLabel(conn.type) : "";
+    let target: Awaited<ReturnType<typeof resolveQueryTarget>> | null = null;
+    if (conn) {
+      try {
+        target = await resolveQueryTarget({
+          connectionId: conn.id,
+          organizationId: user.organizationId,
+          tenantKey,
+          requireScope: args.requireScope,
+        });
+      } catch (error) {
+        if (error instanceof ScopeError) {
+          // A scoping failure is never answered around. There is no fallback to
+          // an unscoped read, because that fallback is the breach.
+          return {
+            status: 403,
+            body: { error: error.message, code: error.code, sessionId: session.id },
+          };
+        }
+        throw error;
+      }
+    }
+    const queryTarget = target;
+
+    if (queryTarget?.scope.tenantId) {
+      args.onTenantResolved?.({
+        organizationId: user.organizationId,
+        tenantId: queryTarget.scope.tenantId,
+      });
+    }
 
     /* ---------------------------------------------------------------------- */
     /* 1. Schema context (cached; profiled from the live database)            */
@@ -279,6 +537,7 @@ export async function runChatPipeline(args: {
           () =>
             getSchemaContext(connectionId, user.organizationId, {
               forceRefresh: Boolean(refreshSchema),
+              scope: queryTarget?.scope ?? null,
             }),
           (ctx) => {
             const valueLists = ctx.tables.reduce(
@@ -718,7 +977,7 @@ export async function runChatPipeline(args: {
       const validation = await step(
         "validate",
         "Checking the query against the database",
-        () => validateQuery(connectionId, user.organizationId, plan.sql),
+        () => validateQuery(queryTarget!, plan.sql),
         (v) => (v.valid ? "valid" : `rejected: ${(v.error || "").slice(0, 120)}`)
       );
 
@@ -781,7 +1040,7 @@ export async function runChatPipeline(args: {
       const executed = await step(
         "execute",
         "Running the query",
-        () => executeQuery(connectionId, user.organizationId, plan.sql),
+        () => executeQuery(queryTarget!, plan.sql),
         (r) =>
           r.error
             ? `failed: ${r.error.slice(0, 120)}`
@@ -864,7 +1123,7 @@ export async function runChatPipeline(args: {
       totalRowCount = await step(
         "count",
         "Counting the full result set",
-        () => countRows(connectionId, user.organizationId, plan.sql),
+        () => countRows(queryTarget!, plan.sql),
         (n) => (n === null ? "unavailable" : `${n.toLocaleString()} rows match`)
       );
     }

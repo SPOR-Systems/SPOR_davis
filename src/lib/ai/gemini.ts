@@ -8,6 +8,7 @@ import {
   buildKnowledgePrompt,
   buildSchemaOverviewPrompt,
 } from "@/lib/ai/prompts";
+import { countProviderCall } from "@/lib/embed/meter";
 import type {
   AnswerChartContext,
   KnowledgePromptInput,
@@ -294,6 +295,15 @@ async function generateJson(
             },
           });
 
+          // Metered here, at the SDK boundary: this is what was paid for,
+          // whether or not the result turns out to be usable below.
+          countProviderCall({
+            input: response.usageMetadata?.promptTokenCount,
+            output:
+              (response.usageMetadata?.candidatesTokenCount ?? 0) +
+              (response.usageMetadata?.thoughtsTokenCount ?? 0),
+          });
+
           // Same check the prose path has had. Its absence here is why a
           // truncated plan surfaced as a meaningless "unparseable response".
           const finish = response.candidates?.[0]?.finishReason;
@@ -352,6 +362,13 @@ async function generateText(
           httpOptions: { timeout: ctx.timeoutMs },
           abortSignal: ctx.signal,
         },
+      });
+
+      countProviderCall({
+        input: response.usageMetadata?.promptTokenCount,
+        output:
+          (response.usageMetadata?.candidatesTokenCount ?? 0) +
+          (response.usageMetadata?.thoughtsTokenCount ?? 0),
       });
 
       // A truncated answer is worse than no answer: it looks complete and is

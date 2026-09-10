@@ -24,6 +24,12 @@ model Organization {
   chatSessions        ChatSession[]
   auditLogs           AuditLog[]
   knowledgeGaps       KnowledgeGap[]
+  tenants             Tenant[]
+  apiKeys             ApiKey[]
+  embedSessions       EmbedSession[]
+  usageRecords        UsageRecord[]
+  pendingRegistrations PendingRegistration[]
+  invites             UserInvite[]
 
   @@map("organizations")
 }
@@ -42,8 +48,22 @@ model User {
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
+  /// Which tenants this person may query. NONE | LIST | ALL.
+  ///
+  /// This is an AUTHORIZATION list, not a data scope: it decides which tenants
+  /// appear in the picker, never what a query can read. Every question still
+  /// runs against exactly one tenant, with exactly the surface that tenant's
+  /// own users get. A master exercises the same code path as everyone else
+  /// rather than a privileged one that gets less testing.
+  ///
+  /// An ADMIN with NONE resolves to ALL — see lib/embed/access.ts. That is not
+  /// a grant of new power; an admin can already read every connection's
+  /// credentials and reconfigure its scoping.
+  tenantAccessMode String @default("NONE")
+
   chatSessions ChatSession[]
   auditLogs    AuditLog[]
+  tenantGrants UserTenantGrant[]
 
   @@unique([email, organizationId])
   @@map("users")
@@ -67,10 +87,37 @@ model DatabaseConnection {
   createdAt        DateTime         @default(now())
   updatedAt        DateTime         @updatedAt
 
+  // ── Row-level scoping ──
+  /// NONE                 — unscoped. The standalone app. An embedded session
+  ///                        against a NONE connection is REFUSED, so this can
+  ///                        never become an accidental bypass.
+  /// SEPARATE_CREDENTIALS — a database or schema per tenant; the tenant picks
+  ///                        the credentials and isolation is the connection.
+  /// NATIVE_RLS           — the database has row-level security policies; DAVIS
+  ///                        sets the session value the policy reads.
+  /// MANAGED_VIEWS        — shared schema with a tenant column; DAVIS creates
+  ///                        temporary filtered views and reads only those.
+  scopeMode      String  @default("NONE")
+  /// The tenant column, for MANAGED_VIEWS.
+  scopeColumn    String?
+  /// The session setting a NATIVE_RLS policy reads, e.g. "davis.scope".
+  scopeSetting   String?
+  /// JSON array of base tables to expose. For MANAGED_VIEWS these become the
+  /// temporary views; for the other modes they are the allow-list directly.
+  scopedTables   String?
+  /// Proven to isolate (see lib/db/verifyScope.ts). A scoped connection with no
+  /// verification cannot be used — a misconfiguration fails open and looks
+  /// exactly like working software.
+  verifiedAt     DateTime?
+  verifyNote     String?
+
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
-  chatMessages ChatMessage[]
+  chatMessages     ChatMessage[]
+  tenants          Tenant[]
+  scopeCredentials ConnectionScopeCredential[]
+  schemaProfiles   TenantSchemaProfile[]
 
   @@map("database_connections")
 }
@@ -162,8 +209,17 @@ model ChatSession {
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
+  /// Null for the standalone app; set for an embedded conversation. History
+  /// never crosses a tenant boundary.
+  tenantId  String?
+  tenant    Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  /// The integrator's own user id, when they supply one. History is keyed by it
+  /// within a tenant, and is tenant-wide when they do not.
+  endUserId String?
+
   messages ChatMessage[]
 
+  @@index([tenantId, endUserId, updatedAt])
   @@map("chat_sessions")
 }
 
@@ -360,4 +416,322 @@ model KnowledgeConflict {
 
   @@index([knowledgeBaseId, status])
   @@map("knowledge_conflicts")
+}
+
+// ── Multi-tenancy for embedded use ──
+//
+// An integrator is one Organization with many Tenants: an EMR vendor with 800
+// clinics, a retail chain with 4,000 stores. The tenant is the unit of
+// isolation, of billing, and of conversation history — which is why it is a
+// row rather than a string on a session.
+
+model Tenant {
+  id String @id @default(cuid())
+
+  /// The integrator's own identifier — clinic code, store number. THIS is the
+  /// value that reaches the database predicate, so it is validated against a
+  /// strict character allow-list before it is ever used (lib/db/scope.ts).
+  externalKey String
+  label       String
+  /// ACTIVE | SUSPENDED. One flag drives both billing and refusal, so there is
+  /// no state where an integrator is not paying but the tenant still answers.
+  status      String @default("ACTIVE")
+
+  /// Overrides the organization's default connection, where a tenant lives in
+  /// its own database.
+  connectionId String?
+  connection   DatabaseConnection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  /// How long this tenant's conversations are kept, in days. Null = forever.
+  ///
+  /// Storing an end user's questions is a data-protection decision made on the
+  /// integrator's behalf, and their answer will not be "forever" — so it is
+  /// their setting, and the sweep that enforces it ships with the feature
+  /// rather than after it. Retro-fitting deletion onto data you already hold is
+  /// the expensive order to do it in.
+  retentionDays Int?
+
+  /// Provider calls included per billing period. Null = uncapped.
+  ///
+  /// Passing it does NOT stop answers: an end user mid-support-call is the
+  /// wrong person to punish for their supplier's billing arrangement, and a
+  /// widget that stops working is a worse outcome for the integrator than a
+  /// larger invoice. The allowance is carried so an overage is VISIBLE as it
+  /// accrues rather than discovered at month end.
+  creditAllowance Int?
+
+  chatSessions   ChatSession[]
+  userGrants     UserTenantGrant[]
+  schemaProfiles TenantSchemaProfile[]
+  apiKeys        ApiKey[]
+  usage          UsageRecord[]
+  embedSessions  EmbedSession[]
+
+  @@unique([organizationId, externalKey])
+  @@index([organizationId, status])
+  @@map("tenants")
+}
+
+/// A credential an integrator's BACKEND holds. It never reaches a browser.
+///
+/// Keys come in two shapes because they answer different problems. A TENANT key
+/// limits blast radius: if one clinic's key leaks, that clinic is exposed and
+/// the other 799 are not. An ORG key spares a backend from holding and rotating
+/// 4,000 credentials, each of which is one more thing that can leak. A tenant
+/// key asked to mint a session for a different tenant is REFUSED, not corrected.
+model ApiKey {
+  id String @id @default(cuid())
+
+  name String
+  /// Null = an org key, able to mint sessions for any tenant in the org.
+  /// Set  = a tenant key, able to mint sessions for that tenant only.
+  tenantId String?
+  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  /// The leading, non-secret part — "dk_live_a1b2c3d4". Shown in the UI so a
+  /// key can be recognised without being stored.
+  prefix String @unique
+  /// SHA-256 of the whole key. The key itself is displayed once, at creation,
+  /// and cannot be recovered — a store that can show it again is a store that
+  /// can leak it.
+  keyHash String @unique
+
+  lastUsedAt DateTime?
+  /// Revocation is a timestamp, not a delete: an audit trail that loses the
+  /// credential a request was made with is not an audit trail.
+  revokedAt DateTime?
+  /// Optional expiry, for keys issued for a trial or a migration.
+  expiresAt DateTime?
+
+  createdAt DateTime @default(now())
+  createdBy String?
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  sessions EmbedSession[]
+
+  @@index([organizationId, revokedAt])
+  @@map("api_keys")
+}
+
+/// The short-lived, opaque token a widget carries.
+///
+/// Opaque rather than a signed JWT, deliberately: no signing key to distribute,
+/// no clock skew, and a session can be REVOKED BEFORE IT EXPIRES — which is
+/// what matters the day an integrator discovers one of their users should not
+/// have had access.
+///
+/// THE TENANT COMES FROM THIS ROW, NEVER FROM THE REQUEST BODY. A widget that
+/// sends a tenant key is ignored. That is the single most important rule in the
+/// identity design, and it is enforced by the token carrying no claims a
+/// browser could alter.
+model EmbedSession {
+  id String @id @default(cuid())
+
+  /// SHA-256 of the token. Same reasoning as ApiKey.keyHash.
+  tokenHash String @unique
+  /// Leading characters, for support ("which session was that?").
+  prefix String
+
+  /// The integrator's own user id, when they supply one. History is keyed by it
+  /// within a tenant, and is tenant-wide when they do not.
+  endUserId String?
+
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  lastUsedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  /// Where the widget is allowed to run, when the integrator pins it.
+  allowedOrigin String?
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  apiKeyId String?
+  apiKey   ApiKey? @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, expiresAt])
+  @@index([organizationId, createdAt])
+  @@map("embed_sessions")
+}
+
+/// What the invoice is built from.
+///
+/// The meter counts PROVIDER CALLS, not HTTP requests, because they diverge and
+/// the divergence is the interesting part: a knowledge question on the fast path
+/// skips planning entirely, and a question needing three repair rounds costs
+/// four. Counting requests would hide both, and would make the caching work
+/// invisible instead of visible as a saving.
+model UsageRecord {
+  id String @id @default(cuid())
+
+  /// The billing bucket, "2026-09".
+  period String
+
+  questions     Int @default(0)
+  providerCalls Int @default(0)
+  inputTokens   Int @default(0)
+  outputTokens  Int @default(0)
+  /// Questions that were refused before any provider call — a scope failure, a
+  /// suspended tenant, a rate limit. Not billable, but the number an integrator
+  /// asks about when something is wrong.
+  refusals Int @default(0)
+
+  firstAt DateTime @default(now())
+  lastAt  DateTime @updatedAt
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, period])
+  @@index([organizationId, period])
+  @@map("usage_records")
+}
+
+/// Someone who asked to join an organization and is waiting to be let in.
+///
+/// A SEPARATE TABLE, not a User with a "pending" flag. A pending person is not
+/// a member, and a flag is something every future query has to remember to
+/// filter on — the first one that forgets puts a stranger in the members list,
+/// or worse, in a tenant-access grant. Here they cannot be selected by accident
+/// because they are not in the users table at all.
+///
+/// The password is hashed at request time so that approving is one click and
+/// the person can simply sign in afterwards, rather than needing a second
+/// round trip to set a password they already chose.
+model PendingRegistration {
+  id String @id @default(cuid())
+
+  email        String
+  name         String
+  passwordHash String
+
+  /// PENDING | DENIED. An approved row is deleted, not kept — the User it
+  /// became is the record, and a stale "approved" row is one more thing that
+  /// could be mistaken for a live request.
+  status String @default("PENDING")
+  /// Why it was denied, if the admin said.
+  note String?
+
+  createdAt  DateTime  @default(now())
+  reviewedAt DateTime?
+  reviewedBy String?
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, email])
+  @@index([organizationId, status])
+  @@map("pending_registrations")
+}
+
+/// An admin-created invitation: the role and tenant access are decided BEFORE
+/// the person exists, so nobody is ever briefly a member with no access
+/// settings while someone remembers to go and set them.
+model UserInvite {
+  id String @id @default(cuid())
+
+  email String
+  name  String
+  role  String @default("MEMBER")
+
+  /// NONE | LIST | ALL, applied when the invite is accepted.
+  tenantAccessMode String @default("NONE")
+  /// JSON array of tenant ids, for LIST.
+  tenantIds String?
+
+  /// SHA-256 of the link token. The link is shown once, to the admin who
+  /// created it; a store that can show it again is a store that can leak it.
+  tokenHash String    @unique
+  expiresAt DateTime
+  acceptedAt DateTime?
+  revokedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  createdBy String?
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, acceptedAt])
+  @@map("user_invites")
+}
+
+/// One person's permission to query one tenant.
+///
+/// Rows exist only for tenantAccessMode = "LIST". ALL needs no rows (and at
+/// 4,000 tenants should not have 4,000 of them), and NONE means there are none
+/// to have.
+model UserTenantGrant {
+  id String @id @default(cuid())
+
+  createdAt DateTime @default(now())
+  grantedBy String?
+
+  userId String
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, tenantId])
+  @@index([userId])
+  @@map("user_tenant_grants")
+}
+
+/// The statistical half of a schema profile, measured over ONE tenant's rows.
+///
+/// Row counts, distinct counts and enumerated code values are facts about the
+/// rows they were measured from. Caching them on the connection would put one
+/// tenant's data into the prompt used to answer another, so they are keyed by
+/// tenant and the structural half is cached separately.
+model TenantSchemaProfile {
+  id String @id @default(cuid())
+
+  /// SchemaStatistics as JSON. Carries the tenantId it was measured for, which
+  /// is checked on read rather than trusted from the key.
+  statistics  String
+  generatedAt DateTime @default(now())
+
+  connectionId String
+  connection   DatabaseConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, tenantId])
+  @@map("tenant_schema_profiles")
+}
+
+/// Per-tenant credentials, for SEPARATE_CREDENTIALS connections.
+model ConnectionScopeCredential {
+  id String @id @default(cuid())
+
+  scopeKey String
+  /// Any of these that are set override the connection's own values.
+  database String?
+  username String?
+  encryptedPassword String?
+
+  createdAt DateTime @default(now())
+
+  connectionId String
+  connection   DatabaseConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, scopeKey])
+  @@map("connection_scope_credentials")
 }

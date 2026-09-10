@@ -1,6 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  cachedJson,
+  invalidatePrefix,
+  prefetchJson,
+  remembered,
+} from "@/lib/clientCache";
 import Link from "next/link";
 
 /**
@@ -134,17 +140,57 @@ export default function KnowledgePage() {
 
   const fileInput = useRef<HTMLInputElement>(null);
 
-  const load = useCallback(async () => {
-    const [kb, docs, arts] = await Promise.all([
-      fetch("/api/knowledge").then((r) => r.json()).catch(() => null),
-      fetch("/api/knowledge/documents").then((r) => r.json()).catch(() => null),
-      fetch("/api/knowledge/articles").then((r) => r.json()).catch(() => null),
-    ]);
+  const apply = useCallback((kb: any, docs: any, arts: any) => {
     if (kb?.counts) setCounts(kb.counts);
     if (kb?.isAdmin !== undefined) setIsAdmin(Boolean(kb.isAdmin));
     if (docs?.documents) setDocuments(docs.documents);
     if (arts?.articles) setArticles(arts.articles);
   }, []);
+
+  /**
+   * Show whatever the dashboard already prefetched, immediately, then check.
+   *
+   * These three requests used to run on every visit while the page sat empty.
+   * They are the same three every time, and the answer rarely changes between
+   * one visit and the next — so the wait was almost always for news that there
+   * was no news.
+   *
+   * `fresh` forces a round trip, for after an upload or a delete, where the
+   * whole point is that something DID change.
+   */
+  const load = useCallback(
+    async (opts: { fresh?: boolean } = {}) => {
+      const urls = [
+        "/api/knowledge",
+        "/api/knowledge/documents",
+        "/api/knowledge/articles",
+      ] as const;
+
+      if (opts.fresh) invalidatePrefix("/api/knowledge");
+
+      if (!opts.fresh) {
+        const ready = urls.map((u) => cachedJson<any>(u));
+        if (ready.every(Boolean)) {
+          const [kb, docs, arts] = await Promise.all(ready as Promise<any>[]);
+          apply(kb, docs, arts);
+          // Painted from cache; now confirm it is still true, quietly.
+          invalidatePrefix("/api/knowledge");
+        } else {
+          // Nothing in memory — a refresh. Paint from the copy kept in
+          // sessionStorage so the page is filled in before the network answers,
+          // rather than sitting empty for the length of a round trip.
+          const saved = urls.map((u) => remembered<any>(u));
+          if (saved.every(Boolean)) apply(saved[0], saved[1], saved[2]);
+        }
+      }
+
+      const [kb, docs, arts] = await Promise.all(
+        urls.map((u) => prefetchJson<any>(u).catch(() => null))
+      );
+      apply(kb, docs, arts);
+    },
+    [apply]
+  );
 
   useEffect(() => {
     void load();
@@ -197,7 +243,7 @@ export default function KnowledgePage() {
       ["PENDING", "EXTRACTING", "EMBEDDING"].includes(d.status)
     );
     if (!working) return;
-    const id = setInterval(() => void load(), 2500);
+    const id = setInterval(() => void load({ fresh: true }), 2500);
     return () => clearInterval(id);
   }, [documents, load]);
 
@@ -213,7 +259,7 @@ export default function KnowledgePage() {
         setNotice({ kind: "error", text: body?.error || `${name} could not be deleted.` });
         return;
       }
-      await load();
+      await load({ fresh: true });
     } catch {
       setNotice({ kind: "error", text: `${name} could not be deleted.` });
     } finally {
@@ -252,7 +298,7 @@ export default function KnowledgePage() {
         }
       }
       setNotice({ kind: "info", text: parts.join(" ") });
-      await load();
+      await load({ fresh: true });
     } catch {
       setNotice({ kind: "error", text: "The re-scan could not run." });
     } finally {
@@ -284,7 +330,7 @@ export default function KnowledgePage() {
 
     setUploading(false);
     if (fileInput.current) fileInput.current.value = "";
-    await load();
+    await load({ fresh: true });
   };
 
   return (
@@ -490,7 +536,7 @@ export default function KnowledgePage() {
           onSaved={() => {
             setEditorOpen(false);
             setSeed(null);
-            void load();
+            void load({ fresh: true });
           }}
         />
       )}

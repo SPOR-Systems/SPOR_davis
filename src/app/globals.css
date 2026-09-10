@@ -2756,3 +2756,329 @@ a.ks-link:hover { border-color: var(--border-hover); border-left-color: var(--te
     animation-duration: 2.4s;
   }
 }
+
+/* ==========================================================================
+   ADMIN CONSOLE — tenants, scoping, keys, usage, access
+   ========================================================================== */
+
+.adm-page { max-width: 1100px; margin: 0 auto; }
+
+.adm-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: var(--space-6); margin-bottom: var(--space-6);
+}
+.adm-title { font-size: 1.5rem; font-weight: 700; color: var(--text-primary); }
+.adm-sub {
+  font-size: 0.875rem; color: var(--text-secondary);
+  margin-top: 0.35rem; max-width: 62ch; line-height: 1.55;
+}
+.adm-actions { display: flex; gap: var(--space-2); flex-shrink: 0; }
+
+.adm-card {
+  background: var(--bg-surface); border: 1px solid var(--border-subtle);
+  border-radius: 0.75rem; padding: var(--space-6); margin-bottom: var(--space-6);
+}
+.adm-card-title {
+  font-size: 0.95rem; font-weight: 600; color: var(--text-primary);
+  margin-bottom: 0.35rem;
+}
+.adm-card-note {
+  font-size: 0.8125rem; color: var(--text-secondary);
+  line-height: 1.55; max-width: 68ch; margin-bottom: var(--space-4);
+}
+
+/* ── Tables ─────────────────────────────────────────────────────────────── */
+.adm-table-wrap { overflow-x: auto; }
+.adm-table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+.adm-table th {
+  text-align: left; font-weight: 600; font-size: 0.75rem;
+  text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-muted); padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border-default); white-space: nowrap;
+}
+.adm-table td {
+  padding: 0.7rem 0.75rem; border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary); vertical-align: middle;
+}
+.adm-table tr:last-child td { border-bottom: none; }
+.adm-table tbody tr:hover { background: var(--bg-surface-hover); }
+.adm-table td.adm-strong { color: var(--text-primary); font-weight: 500; }
+/* Figures align down the column, so a long number is visibly long. */
+.adm-num { text-align: right; font-variant-numeric: tabular-nums; }
+.adm-key { font-family: var(--font-mono); font-size: 0.8125rem; }
+
+.adm-empty {
+  padding: var(--space-8); text-align: center;
+  color: var(--text-muted); font-size: 0.875rem;
+}
+
+/* ── Forms ──────────────────────────────────────────────────────────────── */
+.adm-field { margin-bottom: var(--space-4); }
+.adm-field-label {
+  display: block; font-size: 0.8125rem; font-weight: 500;
+  color: var(--text-secondary); margin-bottom: 0.35rem;
+}
+.adm-field-hint {
+  font-size: 0.75rem; color: var(--text-muted);
+  margin-top: 0.3rem; line-height: 1.5;
+}
+.adm-row { display: flex; gap: var(--space-4); flex-wrap: wrap; }
+.adm-row > * { flex: 1 1 220px; min-width: 0; }
+.adm-textarea {
+  min-height: 120px; font-family: var(--font-mono);
+  font-size: 0.8125rem; resize: vertical;
+}
+.adm-search { max-width: 340px; }
+
+/* ── Notices ────────────────────────────────────────────────────────────── */
+.adm-notice {
+  padding: 0.75rem 1rem; border-radius: 0.5rem; font-size: 0.8125rem;
+  line-height: 1.55; margin-bottom: var(--space-4);
+  border: 1px solid var(--border-default); background: var(--bg-surface-elevated);
+  color: var(--text-secondary);
+}
+.adm-notice-error { border-color: rgba(239,68,68,0.35); background: var(--danger-bg); color: #FCA5A5; }
+.adm-notice-ok { border-color: rgba(16,185,129,0.35); background: var(--success-bg); color: #6EE7B7; }
+.adm-notice-warn { border-color: rgba(245,158,11,0.35); background: var(--warning-bg); color: #FCD34D; }
+
+/* The one-time secret. Deliberately loud: it cannot be shown again. */
+.adm-secret {
+  font-family: var(--font-mono); font-size: 0.8125rem; word-break: break-all;
+  background: var(--bg-input); border: 1px solid var(--border-active);
+  border-radius: 0.5rem; padding: 0.75rem; margin: 0.6rem 0;
+  color: var(--text-primary); user-select: all;
+}
+
+/* ── Verification panel ─────────────────────────────────────────────────── */
+.adm-check {
+  display: flex; gap: 0.7rem; padding: 0.6rem 0;
+  border-bottom: 1px solid var(--border-subtle); font-size: 0.8125rem;
+}
+.adm-check:last-child { border-bottom: none; }
+.adm-check-mark { flex-shrink: 0; width: 1.1rem; font-weight: 700; line-height: 1.5; }
+.adm-check-pass { color: var(--success); }
+.adm-check-fail { color: var(--danger); }
+.adm-check-na { color: var(--text-muted); }
+.adm-check-name { color: var(--text-primary); font-weight: 500; }
+.adm-check-detail { color: var(--text-secondary); margin-top: 0.15rem; line-height: 1.5; }
+
+/* ── Meters ─────────────────────────────────────────────────────────────── */
+.adm-meter {
+  position: relative; height: 6px; border-radius: 3px;
+  background: var(--bg-surface-elevated); overflow: hidden; min-width: 90px;
+}
+.adm-meter-fill { position: absolute; inset: 0 auto 0 0; background: var(--brand-primary); }
+.adm-meter-over { background: var(--warning); }
+
+/* ── Stat tiles ─────────────────────────────────────────────────────────── */
+.adm-stats { display: flex; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-6); }
+.adm-stat {
+  flex: 1 1 160px; background: var(--bg-surface);
+  border: 1px solid var(--border-subtle); border-radius: 0.75rem; padding: var(--space-4);
+}
+.adm-stat-label {
+  font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-muted); margin-bottom: 0.35rem;
+}
+/* Proportional figures: tabular-nums makes a large standalone number read loose. */
+.adm-stat-value { font-size: 1.5rem; font-weight: 700; color: var(--text-primary); line-height: 1.1; }
+.adm-stat-foot { font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.3rem; }
+
+/* ── Tabs ───────────────────────────────────────────────────────────────── */
+.adm-tabs {
+  display: flex; gap: 0.25rem; border-bottom: 1px solid var(--border-default);
+  margin-bottom: var(--space-6);
+}
+.adm-tab {
+  padding: 0.6rem 0.9rem; font-size: 0.875rem; font-weight: 500;
+  color: var(--text-secondary); background: none; border: none;
+  border-bottom: 2px solid transparent; cursor: pointer; margin-bottom: -1px;
+}
+.adm-tab:hover { color: var(--text-primary); }
+.adm-tab-active { color: var(--brand-light); border-bottom-color: var(--brand-primary); }
+
+/* ── Chips ──────────────────────────────────────────────────────────────── */
+.adm-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.5rem; }
+.adm-chip {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.25rem 0.5rem; border-radius: 0.4rem; font-size: 0.75rem;
+  background: var(--bg-surface-elevated); border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+}
+.adm-chip-x { cursor: pointer; color: var(--text-muted); font-weight: 700; }
+.adm-chip-x:hover { color: var(--danger); }
+
+/* ── Tenant picker in chat ──────────────────────────────────────────────── */
+.tp { position: relative; display: inline-block; }
+.tp-btn {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  /* Matches .chat-select below so the two controls line up as one row. */
+  padding: 0.5rem 0.75rem; border-radius: var(--radius-md); font-size: 0.8125rem;
+  line-height: 1.25;
+  background: var(--bg-surface-elevated); border: 1px solid var(--border-subtle);
+  color: var(--text-primary); cursor: pointer;
+  /* Without this the label wraps to three lines the moment the row is tight,
+     and a control three times the height of its neighbour looks broken. */
+  white-space: nowrap;
+  flex-shrink: 0;
+  max-width: 220px;
+}
+.tp-btn-label {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tp-btn:hover { border-color: var(--border-hover); }
+.tp-caret { color: var(--text-muted); font-size: 0.7rem; }
+.tp-menu {
+  position: absolute; z-index: 40; top: calc(100% + 0.35rem);
+  /* Anchored to its RIGHT edge, because this control lives in a right-hand
+     toolbar: hanging a 300px panel off the left of a button that is already
+     near the window edge puts most of it past the edge. */
+  right: 0; left: auto;
+  width: 320px;
+  /* And on a narrow window, never wider than there is room for. */
+  max-width: calc(100vw - 2rem);
+  max-height: min(360px, 60vh); overflow-y: auto;
+  background: var(--bg-surface); border: 1px solid var(--border-default);
+  border-radius: 0.6rem; box-shadow: var(--shadow-lg); padding: 0.4rem;
+}
+.tp-search { width: 100%; margin-bottom: 0.35rem; }
+.tp-item {
+  display: block; width: 100%; text-align: left; padding: 0.45rem 0.55rem;
+  border-radius: 0.4rem; background: none; border: none; cursor: pointer;
+  color: var(--text-secondary); font-size: 0.8125rem;
+}
+.tp-item:hover { background: var(--bg-surface-hover); color: var(--text-primary); }
+.tp-item-active { background: var(--bg-surface-elevated); color: var(--text-primary); }
+.tp-item-key { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); }
+.tp-empty { padding: 0.6rem; font-size: 0.8125rem; color: var(--text-muted); }
+.tp-note {
+  font-size: 0.75rem; color: var(--text-muted);
+  padding: 0.4rem 0.55rem; border-top: 1px solid var(--border-subtle); margin-top: 0.3rem;
+}
+
+/* ── Floating dialog ─────────────────────────────────────────────────────── */
+/* An inline panel that appears below the fold is a panel nobody knows opened.
+   These centre over the page, so the thing you just asked for is where you are
+   already looking. */
+.adm-modal-backdrop {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+  padding: var(--space-4);
+  background: rgba(3, 6, 12, 0.72);
+  backdrop-filter: blur(3px);
+  animation: admFade 120ms ease-out;
+}
+@keyframes admFade { from { opacity: 0 } to { opacity: 1 } }
+
+.adm-modal {
+  width: min(580px, 100%);
+  max-height: min(86vh, 780px);
+  display: flex; flex-direction: column;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: 0.9rem;
+  box-shadow: var(--shadow-xl);
+  animation: admRise 140ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+@keyframes admRise {
+  from { opacity: 0; transform: translateY(8px) scale(0.985) }
+  to   { opacity: 1; transform: none }
+}
+
+.adm-modal-head {
+  padding: var(--space-5) var(--space-6);
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4);
+}
+.adm-modal-title { font-size: 1rem; font-weight: 600; color: var(--text-primary); }
+.adm-modal-sub { font-size: 0.8125rem; color: var(--text-secondary); margin-top: 0.2rem; line-height: 1.5; }
+.adm-modal-x {
+  background: none; border: none; cursor: pointer; line-height: 1;
+  color: var(--text-muted); font-size: 1.25rem; padding: 0 0.15rem;
+}
+.adm-modal-x:hover { color: var(--text-primary); }
+
+/* Only the body scrolls, so the buttons never leave the screen — the whole
+   point of the change. */
+.adm-modal-body { padding: var(--space-6); overflow-y: auto; flex: 1 1 auto; }
+.adm-modal-body .adm-field:last-child { margin-bottom: 0; }
+
+.adm-modal-foot {
+  padding: var(--space-4) var(--space-6);
+  border-top: 1px solid var(--border-subtle);
+  display: flex; gap: var(--space-2); justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+/* The key beneath a tenant's name: available when you need to match on it,
+   quiet enough that the name is what you read. */
+.adm-chip-key {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  margin-top: 0.1rem;
+}
+
+/* ── Chat header controls ────────────────────────────────────────────────── */
+/* `.input` is width:100%, which is right in a form and wrong in a toolbar:
+   in a flex row it stretches to fill and drags its neighbours out of shape. */
+.chat-bar-controls {
+  display: flex; align-items: center; gap: var(--space-3);
+  flex-shrink: 0;
+}
+.chat-bar-label {
+  font-size: 0.8125rem; color: var(--text-muted);
+  white-space: nowrap; flex-shrink: 0;
+}
+.chat-select {
+  width: auto;
+  min-width: 170px;
+  max-width: 240px;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8125rem;
+  line-height: 1.25;
+  background: var(--bg-surface-elevated);
+  border-color: var(--border-subtle);
+  flex-shrink: 0;
+}
+
+/* A count on a sidebar item. Sits at the far end so the label stays readable
+   and the number is where the eye already sweeps for one. */
+.nav-badge {
+  margin-left: auto;
+  min-width: 1.25rem;
+  padding: 0.05rem 0.35rem;
+  border-radius: 999px;
+  background: var(--brand-primary);
+  color: #fff;
+  font-size: 0.6875rem;
+  font-weight: 700;
+  line-height: 1.45;
+  text-align: center;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+
+/* One tenant and no choice to make: show the name, not a menu. */
+.tp-fixed {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  padding: 0.5rem 0.75rem; border-radius: var(--radius-md);
+  font-size: 0.8125rem; line-height: 1.25; white-space: nowrap;
+  background: var(--bg-surface-elevated); border: 1px solid var(--border-subtle);
+  color: var(--text-primary); flex-shrink: 0; max-width: 260px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.tp-fixed-dot {
+  width: 6px; height: 6px; border-radius: 999px;
+  background: var(--teal-primary); flex-shrink: 0;
+}
+
+/* Section heading inside the source menu. */
+.tp-group {
+  padding: 0.5rem 0.55rem 0.25rem;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  font-weight: 600;
+}

@@ -2,6 +2,7 @@
 
 import React, { createContext, useContext, useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
+import { forgetAll } from "@/lib/clientCache";
 
 interface User {
   id: string;
@@ -85,6 +86,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = async () => {
+    // Whoever signs in next on this machine must not find the last person's
+    // documents sitting in storage.
+    forgetAll();
     // Call an endpoint to clear the cookie, or just clear client state 
     // and rely on server returning 401. Since we set HttpOnly cookie, we should have a logout endpoint.
     // For now, we'll just clear state and redirect. A real logout endpoint would be better.

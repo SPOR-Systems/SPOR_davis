@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { executeQuery } from "@/lib/db/queryRunner";
+import { executeQuery, resolveQueryTarget } from "@/lib/db/queryRunner";
+import { ScopeError } from "@/lib/db/scope";
+import { TenantAccessError, assertConnectionAllowed } from "@/lib/embed/access";
 import { isIdentifierColumn } from "@/lib/ai/facts";
 
 /**
@@ -292,7 +294,54 @@ export async function GET(request: NextRequest) {
   });
   const question = priorQuestion?.content || message.session.title || "DAVIS export";
 
-  const result = await executeQuery(message.connectionId, user.organizationId, sql);
+  // The export re-runs the query, so it re-resolves the scope. It must not be
+  // the back door that runs a tenant's SQL unscoped: the conversation's tenant
+  // is the tenant, and a conversation whose tenant has since been suspended or
+  // removed does not export.
+  // Re-running a saved query is still a query. Someone whose tenant access was
+  // narrowed since they asked it should not be able to run it again by way of
+  // the export button.
+  try {
+    await assertConnectionAllowed(user.userId, user.organizationId, message.connectionId);
+  } catch (error) {
+    if (error instanceof TenantAccessError) {
+      return NextResponse.json({ error: error.message, code: error.code }, { status: error.status });
+    }
+    throw error;
+  }
+
+  let target;
+  try {
+    let tenantKey: string | null = null;
+    if (message.session.tenantId) {
+      const owner = await prisma.tenant.findUnique({
+        where: { id: message.session.tenantId },
+        select: { externalKey: true },
+      });
+      if (!owner) {
+        return NextResponse.json(
+          {
+            error: "This conversation belongs to a tenant that no longer exists.",
+            code: "NO_TENANT",
+          },
+          { status: 404 }
+        );
+      }
+      tenantKey = owner.externalKey;
+    }
+    target = await resolveQueryTarget({
+      connectionId: message.connectionId,
+      organizationId: user.organizationId,
+      tenantKey,
+    });
+  } catch (error) {
+    if (error instanceof ScopeError) {
+      return NextResponse.json({ error: error.message, code: error.code }, { status: 403 });
+    }
+    throw error;
+  }
+
+  const result = await executeQuery(target, sql);
   if (result.error) {
     return NextResponse.json(
       {

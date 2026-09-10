@@ -6,6 +6,12 @@ import {
   getDbCredentials,
   openConnection,
 } from "@/lib/db/connection";
+import {
+  openScopedConnection,
+  scopeConfigFor,
+  scopedViewName,
+  type ScopeContext,
+} from "@/lib/db/scope";
 
 /**
  * ============================================================================
@@ -433,99 +439,344 @@ async function profileDateFormats(
 /* Build                                                                      */
 /* -------------------------------------------------------------------------- */
 
-export async function buildSchemaContext(
-  connectionId: string,
-  orgId: string
-): Promise<SchemaContext> {
-  const credentials = await getDbCredentials(connectionId, orgId);
-  const dialect = credentials.type.toUpperCase() as Dialect;
-  const handle = await openConnection(credentials);
+/* -------------------------------------------------------------------------- */
+/* Structural vs statistical                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The profile splits in two because the two halves have different owners.
+ *
+ * STRUCTURE — table and column names, types, primary and foreign keys — is a
+ * property of the database. Every tenant on a shared schema sees the same one,
+ * so it is introspected once and cached on the connection.
+ *
+ * STATISTICS — row counts, null counts, distinct counts, enumerated values,
+ * min/max, detected date formats — are properties of the ROWS. On a scoped
+ * connection those are the tenant's rows, and every one of them is a fact about
+ * that tenant's data. A shared cache would put clinic A's row counts and clinic
+ * A's actual status codes into the prompt DAVIS uses to answer clinic B, which
+ * is a leak even though no query ever crossed the boundary.
+ *
+ * So statistics are measured through the scoped surface and cached per tenant.
+ */
+export interface SchemaStructure {
+  dialect: string;
+  database: string;
+  tables: { name: string; columns: ColumnMeta[] }[];
+  foreignKeys: ForeignKeyMeta[];
+  generatedAt: string;
+  truncated?: string[];
+}
+
+export interface ColumnStatistics {
+  nullCount?: number;
+  distinctCount?: number;
+  enumValues?: { value: string; count: number }[];
+  min?: string;
+  max?: string;
+  dateFormats?: string[];
+  warnings?: string[];
+}
+
+export interface SchemaStatistics {
+  generatedAt: string;
+  /** Whose rows these describe. Null for an unscoped connection. */
+  tenantId: string | null;
+  tables: Record<string, { rowCount: number; columns: Record<string, ColumnStatistics> }>;
+}
+
+/** What lands in `DatabaseConnection.schemaCache`. */
+interface CachedProfile {
+  structure: SchemaStructure;
+  /** Present only for an unscoped connection, where the rows belong to nobody. */
+  statistics?: SchemaStatistics;
+}
+
+/** The two halves, recombined into the shape every caller downstream expects. */
+export function mergeSchema(
+  structure: SchemaStructure,
+  statistics: SchemaStatistics | null
+): SchemaContext {
+  return {
+    dialect: structure.dialect,
+    database: structure.database,
+    generatedAt: statistics?.generatedAt || structure.generatedAt,
+    foreignKeys: structure.foreignKeys,
+    truncated: structure.truncated,
+    tables: structure.tables.map((t) => {
+      const stat = statistics?.tables[t.name];
+      return {
+        name: t.name,
+        rowCount: stat?.rowCount ?? 0,
+        columns: t.columns.map((c) => ({ ...c, ...(stat?.columns[c.name] || {}) })),
+      };
+    }),
+  };
+}
+
+/** Read a cached profile, tolerating the pre-split flat shape. */
+function parseCachedProfile(raw: string): CachedProfile | null {
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed?.structure?.tables?.length) return parsed as CachedProfile;
+    // Legacy: a flat SchemaContext with statistics inlined on the tables.
+    if (Array.isArray(parsed?.tables) && parsed.tables.length) {
+      const legacy = parsed as SchemaContext;
+      const statistics: SchemaStatistics = {
+        generatedAt: legacy.generatedAt,
+        tenantId: null,
+        tables: {},
+      };
+      for (const t of legacy.tables) {
+        statistics.tables[t.name] = { rowCount: t.rowCount, columns: {} };
+        for (const c of t.columns) {
+          statistics.tables[t.name]!.columns[c.name] = {
+            nullCount: c.nullCount,
+            distinctCount: c.distinctCount,
+            enumValues: c.enumValues,
+            min: c.min,
+            max: c.max,
+            dateFormats: c.dateFormats,
+            warnings: c.warnings,
+          };
+        }
+      }
+      return {
+        structure: {
+          dialect: legacy.dialect,
+          database: legacy.database,
+          tables: legacy.tables.map((t) => ({ name: t.name, columns: t.columns })),
+          foreignKeys: legacy.foreignKeys,
+          generatedAt: legacy.generatedAt,
+          truncated: legacy.truncated,
+        },
+        statistics,
+      };
+    }
+  } catch {
+    /* corrupt cache — rebuild */
+  }
+  return null;
+}
+
+function fresh(generatedAt: string): boolean {
+  const age = Date.now() - new Date(generatedAt).getTime();
+  return Number.isFinite(age) && age >= 0 && age < SCHEMA_CACHE_TTL_MS;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Building each half                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Structure only. `expose` restricts and renames what the model is shown: on a
+ * scoped connection it maps each readable base table to the object the query is
+ * actually allowed to name, so a base table never appears in the prompt.
+ */
+async function buildStructure(
+  handle: DbHandle,
+  dialect: Dialect,
+  credentials: { type: string; database: string },
+  expose: Map<string, string> | null
+): Promise<SchemaStructure> {
   const truncated: string[] = [];
 
+  let raw: { columns: RawColumn[]; fks: ForeignKeyMeta[] };
+  if (dialect === "POSTGRESQL") {
+    raw = await introspectPostgres(handle);
+  } else if (dialect === "MYSQL" || dialect === "MARIADB") {
+    raw = await introspectMysql(handle, credentials.database);
+  } else if (dialect === "SQLITE") {
+    raw = await introspectSqlite(handle);
+  } else {
+    throw new Error(`Schema introspection not supported for ${credentials.type}`);
+  }
+
+  // Views do not carry foreign keys, so the join graph has to be read off the
+  // base tables and then relabelled onto the objects the model may name.
+  const shown = (base: string): string | null => {
+    if (!expose) return base;
+    return expose.get(base.toLowerCase()) ?? null;
+  };
+
+  const fkIndex = new Map<string, ForeignKeyMeta>();
+  for (const fk of raw.fks) fkIndex.set(`${fk.fromTable}.${fk.fromColumn}`, fk);
+
+  const tableMap = new Map<string, { name: string; columns: ColumnMeta[] }>();
+  for (const c of raw.columns) {
+    const name = shown(c.table);
+    if (!name) continue;
+    if (!tableMap.has(name)) tableMap.set(name, { name, columns: [] });
+    const fk = fkIndex.get(`${c.table}.${c.column}`);
+    const target = fk ? shown(fk.toTable) : null;
+    tableMap.get(name)!.columns.push({
+      name: c.column,
+      type: c.type,
+      nullable: c.nullable,
+      isPrimaryKey: c.isPk,
+      // A join to something the tenant cannot read is not a join path.
+      references: fk && target ? { table: target, column: fk.toColumn } : undefined,
+    });
+  }
+
+  let tables = [...tableMap.values()];
+  if (tables.length > MAX_TABLES) {
+    truncated.push(
+      `Only the first ${MAX_TABLES} of ${tables.length} tables were profiled.`
+    );
+    tables = tables.slice(0, MAX_TABLES);
+  }
+
+  const exposedNames = new Set(tables.map((t) => t.name));
+  const foreignKeys = raw.fks
+    .map((fk) => {
+      const from = shown(fk.fromTable);
+      const to = shown(fk.toTable);
+      return from && to
+        ? { ...fk, fromTable: from, toTable: to }
+        : null;
+    })
+    .filter((fk): fk is ForeignKeyMeta => !!fk)
+    .filter((fk) => exposedNames.has(fk.fromTable) && exposedNames.has(fk.toTable));
+
+  return {
+    dialect: dialectLabel(credentials.type),
+    database: credentials.database,
+    tables,
+    foreignKeys,
+    generatedAt: new Date().toISOString(),
+    truncated: truncated.length ? truncated : undefined,
+  };
+}
+
+/**
+ * Statistics only, measured over whatever rows `handle` can see. Called with a
+ * scoped handle on a scoped connection, so every number here is the tenant's.
+ */
+async function buildStatistics(
+  handle: DbHandle,
+  dialect: Dialect,
+  structure: SchemaStructure,
+  tenantId: string | null
+): Promise<SchemaStatistics> {
+  const stats: SchemaStatistics = {
+    generatedAt: new Date().toISOString(),
+    tenantId,
+    tables: {},
+  };
+
+  for (const table of structure.tables) {
+    // profileTable mutates the column objects it is given, so it gets copies:
+    // the cached structure must stay free of anyone's statistics.
+    const columns: ColumnMeta[] = table.columns.map((c) => ({ ...c }));
+    const rowCount = await profileTable(handle, dialect, table.name, columns);
+    const entry = { rowCount, columns: {} as Record<string, ColumnStatistics> };
+    stats.tables[table.name] = entry;
+    if (rowCount === 0) continue;
+
+    for (const col of columns.slice(0, MAX_COLS_PER_TABLE)) {
+      const enumerable =
+        (col.distinctCount ?? Infinity) <= MAX_ENUM_DISTINCT &&
+        (col.distinctCount ?? 0) > 0 &&
+        !col.isPrimaryKey;
+
+      if (enumerable) {
+        await enumerateValues(handle, dialect, table.name, col);
+      }
+      if (isDateish(col.name, col.type) && !col.isPrimaryKey) {
+        await profileDateFormats(handle, dialect, table.name, col);
+      }
+      // Flag high-cardinality free text so the model prefers LIKE over `=`.
+      // Dates are excluded: LIKE is the wrong advice for a date column, and
+      // they already carry their own format guidance.
+      if (
+        !enumerable &&
+        isTextual(col.type) &&
+        !col.isPrimaryKey &&
+        !isDateish(col.name, col.type) &&
+        (col.distinctCount ?? 0) > MAX_ENUM_DISTINCT
+      ) {
+        col.warnings = [
+          ...(col.warnings || []),
+          "high-cardinality free text — match with LIKE, never assume an exact literal",
+        ];
+      }
+    }
+
+    for (const col of columns) {
+      entry.columns[col.name] = {
+        nullCount: col.nullCount,
+        distinctCount: col.distinctCount,
+        enumValues: col.enumValues,
+        min: col.min,
+        max: col.max,
+        dateFormats: col.dateFormats,
+        warnings: col.warnings,
+      };
+    }
+  }
+
+  return stats;
+}
+
+/** Base table -> the object a scoped query may name in its place. */
+function exposureMap(scope: ScopeContext, tables: string[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const t of tables) {
+    const leaf = t.includes(".") ? t.split(".").pop()! : t;
+    const presented = scope.mode === "MANAGED_VIEWS" ? scopedViewName(t) : t;
+    map.set(t.toLowerCase(), presented);
+    map.set(leaf.toLowerCase(), presented);
+  }
+  return map;
+}
+
+export async function buildSchemaContext(
+  connectionId: string,
+  orgId: string,
+  scope?: ScopeContext | null
+): Promise<SchemaContext> {
+  const { structure, statistics } = await buildProfile(connectionId, orgId, scope ?? null);
+  return mergeSchema(structure, statistics);
+}
+
+/**
+ * Build both halves in one pass.
+ *
+ * Structure is read on a plain connection (views carry no keys); statistics are
+ * read on the scoped one. On an unscoped connection those are the same handle.
+ */
+async function buildProfile(
+  connectionId: string,
+  orgId: string,
+  scope: ScopeContext | null
+): Promise<{ structure: SchemaStructure; statistics: SchemaStatistics }> {
+  const credentials = await getDbCredentials(connectionId, orgId);
+  const dialect = credentials.type.toUpperCase() as Dialect;
+  const scoped = !!scope && scope.mode !== "NONE";
+
+  const config = scoped ? await scopeConfigFor(connectionId) : null;
+  const expose = scoped ? exposureMap(scope!, config!.tables) : null;
+
+  const structural = await openConnection(credentials);
+  let structure: SchemaStructure;
   try {
-    let raw: { columns: RawColumn[]; fks: ForeignKeyMeta[] };
-    if (dialect === "POSTGRESQL") {
-      raw = await introspectPostgres(handle);
-    } else if (dialect === "MYSQL" || dialect === "MARIADB") {
-      raw = await introspectMysql(handle, credentials.database);
-    } else if (dialect === "SQLITE") {
-      raw = await introspectSqlite(handle);
-    } else {
-      throw new Error(`Schema introspection not supported for ${credentials.type}`);
-    }
+    structure = await buildStructure(structural, dialect, credentials, expose);
+  } finally {
+    await structural.close();
+  }
 
-    // Group columns into tables and attach FK targets.
-    const fkIndex = new Map<string, ForeignKeyMeta>();
-    for (const fk of raw.fks) {
-      fkIndex.set(`${fk.fromTable}.${fk.fromColumn}`, fk);
-    }
-
-    const tableMap = new Map<string, TableMeta>();
-    for (const c of raw.columns) {
-      if (!tableMap.has(c.table)) {
-        tableMap.set(c.table, { name: c.table, rowCount: 0, columns: [] });
-      }
-      const fk = fkIndex.get(`${c.table}.${c.column}`);
-      tableMap.get(c.table)!.columns.push({
-        name: c.column,
-        type: c.type,
-        nullable: c.nullable,
-        isPrimaryKey: c.isPk,
-        references: fk ? { table: fk.toTable, column: fk.toColumn } : undefined,
-      });
-    }
-
-    let tables = [...tableMap.values()];
-    if (tables.length > MAX_TABLES) {
-      truncated.push(
-        `Only the first ${MAX_TABLES} of ${tables.length} tables were profiled.`
-      );
-      tables = tables.slice(0, MAX_TABLES);
-    }
-
-    // Profile each table: counts, ranges, enumerated values, date formats.
-    for (const table of tables) {
-      table.rowCount = await profileTable(handle, dialect, table.name, table.columns);
-      if (table.rowCount === 0) continue;
-
-      for (const col of table.columns.slice(0, MAX_COLS_PER_TABLE)) {
-        const enumerable =
-          (col.distinctCount ?? Infinity) <= MAX_ENUM_DISTINCT &&
-          (col.distinctCount ?? 0) > 0 &&
-          !col.isPrimaryKey;
-
-        if (enumerable) {
-          await enumerateValues(handle, dialect, table.name, col);
-        }
-        if (isDateish(col.name, col.type) && !col.isPrimaryKey) {
-          await profileDateFormats(handle, dialect, table.name, col);
-        }
-        // Flag high-cardinality free text so the model prefers LIKE over `=`.
-        // Dates are excluded: LIKE is the wrong advice for a date column, and
-        // they already carry their own format guidance.
-        if (
-          !enumerable &&
-          isTextual(col.type) &&
-          !col.isPrimaryKey &&
-          !isDateish(col.name, col.type) &&
-          (col.distinctCount ?? 0) > MAX_ENUM_DISTINCT
-        ) {
-          col.warnings = [
-            ...(col.warnings || []),
-            "high-cardinality free text — match with LIKE, never assume an exact literal",
-          ];
-        }
-      }
-    }
-
-    return {
-      dialect: dialectLabel(credentials.type),
-      database: credentials.database,
-      tables,
-      foreignKeys: raw.fks,
-      generatedAt: new Date().toISOString(),
-      truncated: truncated.length ? truncated : undefined,
-    };
+  const handle = scoped
+    ? await openScopedConnection(scope!, config!)
+    : await openConnection(credentials);
+  try {
+    const statistics = await buildStatistics(
+      handle,
+      dialect,
+      structure,
+      scope?.tenantId ?? null
+    );
+    return { structure, statistics };
   } finally {
     await handle.close();
   }
@@ -538,38 +789,84 @@ export async function buildSchemaContext(
 export async function getSchemaContext(
   connectionId: string,
   orgId: string,
-  opts: { forceRefresh?: boolean } = {}
+  opts: { forceRefresh?: boolean; scope?: ScopeContext | null } = {}
 ): Promise<SchemaContext> {
+  const scope = opts.scope ?? null;
+  const scoped = !!scope && scope.mode !== "NONE";
+
+  if (scoped && !scope!.tenantId) {
+    // resolveScope should never produce this, but a statistics cache with no
+    // owner is the one thing this module must not create.
+    throw new Error("A scoped schema profile requires a tenant.");
+  }
+
+  let structure: SchemaStructure | null = null;
+  let statistics: SchemaStatistics | null = null;
+
   if (!opts.forceRefresh) {
     const conn = await prisma.databaseConnection.findFirst({
       where: { id: connectionId, organizationId: orgId },
       select: { schemaCache: true },
     });
-    if (conn?.schemaCache) {
-      try {
-        const cached = JSON.parse(conn.schemaCache) as SchemaContext;
-        const age = Date.now() - new Date(cached.generatedAt).getTime();
-        if (cached.tables?.length && age < SCHEMA_CACHE_TTL_MS) {
-          return cached;
-        }
-      } catch {
-        /* corrupt cache — rebuild */
+    const cached = conn?.schemaCache ? parseCachedProfile(conn.schemaCache) : null;
+    if (cached && fresh(cached.structure.generatedAt)) {
+      structure = cached.structure;
+      if (!scoped && cached.statistics && fresh(cached.statistics.generatedAt)) {
+        statistics = cached.statistics;
       }
     }
+
+    if (scoped && structure) {
+      const row = await prisma.tenantSchemaProfile.findUnique({
+        where: {
+          connectionId_tenantId: { connectionId, tenantId: scope!.tenantId! },
+        },
+      });
+      if (row) {
+        try {
+          const parsed = JSON.parse(row.statistics) as SchemaStatistics;
+          // The owner is checked, not assumed: a profile that names another
+          // tenant is discarded rather than rendered into a prompt.
+          if (parsed.tenantId === scope!.tenantId && fresh(parsed.generatedAt)) {
+            statistics = parsed;
+          }
+        } catch {
+          /* corrupt — rebuild */
+        }
+      }
+    }
+
+    if (structure && statistics) return mergeSchema(structure, statistics);
   }
 
-  const ctx = await buildSchemaContext(connectionId, orgId);
+  const built = await buildProfile(connectionId, orgId, scope);
 
   try {
+    const payload: CachedProfile = scoped
+      ? { structure: built.structure }
+      : { structure: built.structure, statistics: built.statistics };
     await prisma.databaseConnection.update({
       where: { id: connectionId },
-      data: { schemaCache: JSON.stringify(ctx), lastTestedAt: new Date() },
+      data: { schemaCache: JSON.stringify(payload), lastTestedAt: new Date() },
     });
+    if (scoped) {
+      const data = {
+        statistics: JSON.stringify(built.statistics),
+        generatedAt: new Date(),
+      };
+      await prisma.tenantSchemaProfile.upsert({
+        where: {
+          connectionId_tenantId: { connectionId, tenantId: scope!.tenantId! },
+        },
+        update: data,
+        create: { connectionId, tenantId: scope!.tenantId!, ...data },
+      });
+    }
   } catch {
     /* caching is best-effort */
   }
 
-  return ctx;
+  return mergeSchema(built.structure, built.statistics);
 }
 
 /* -------------------------------------------------------------------------- */

@@ -3,10 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "node scripts/dev.mjs",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "warm": "node scripts/warm-routes.mjs",
+    "preview": "next build && next start",
+    "dev:turbo": "next dev --turbo"
   },
   "dependencies": {
     "@google/genai": "^2.20.0",
