@@ -9,7 +9,7 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: postgresql://user:pass@localhost:5432/test
+      DATABASE_URL: file:./prisma/dev.db
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
