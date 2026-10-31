@@ -1,15 +1,16 @@
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
-const fs = require('fs');
+import sqlite3 from "sqlite3";
+import { join } from 'path';
+import { existsSync, unlinkSync } from 'fs';
 
-const dbPath = path.join(__dirname, '../healthcare.db');
+const dbPath = join(__dirname, '../healthcare.db');
+const sqlite = sqlite3.verbose();
 
 // Delete existing DB to start fresh
-if (fs.existsSync(dbPath)) {
-  fs.unlinkSync(dbPath);
+if (existsSync(dbPath)) {
+  unlinkSync(dbPath);
 }
 
-const db = new sqlite3.Database(dbPath);
+const db = new sqlite.Database(dbPath);
 
 db.serialize(() => {
   console.log('Creating convoluted healthcare tables...');
