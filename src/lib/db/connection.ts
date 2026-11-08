@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { decryptText } from "@/lib/encryption";
 import { Client as PgClient } from "pg";
 import mysql from "mysql2/promise";
+const sqlite3 = require("sqlite3").verbose();
 
 /**
  * A single, reusable low-level connection abstraction.
@@ -185,7 +186,6 @@ export async function openConnection(
 
   if (type === "SQLITE") {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const sqlite3 = require("sqlite3").verbose();
     const dbPath = resolveSqlitePath(credentials.database);
 
     const db = await new Promise<any>((resolve, reject) => {
