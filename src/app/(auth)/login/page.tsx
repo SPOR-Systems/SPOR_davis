@@ -166,7 +166,7 @@ export default function LoginPage() {
       </form>
 
       <div className="mt-6 text-center text-sm text-secondary">
-        Don't have an organization account?{" "}
+        Don&apos;t have an organization account?{" "}
         <Link href="/register" className="text-brand font-medium hover:text-brand-primary">
           Register here
         </Link>

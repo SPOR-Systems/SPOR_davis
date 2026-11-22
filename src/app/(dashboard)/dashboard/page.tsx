@@ -13,7 +13,7 @@ export default function DashboardOverview() {
           Welcome back, {user?.name.split(" ")[0]}
         </h1>
         <p className="text-text-secondary">
-          Here's what's happening in your {organization?.name} intelligence workspace today.
+          Here&apos;s what&apos;s happening in your {organization?.name} intelligence workspace today.
         </p>
       </header>
 
